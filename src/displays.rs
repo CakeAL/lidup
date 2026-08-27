@@ -75,8 +75,8 @@ type SetEnabledFn = unsafe extern "C" fn(CGDisplayConfigRef, u32, bool) -> CGErr
 
 fn sky_library() -> Option<&'static Library> {
     SKYLIGHT
-        .get_or_init(|| {
-            unsafe { Library::new("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight").ok() }
+        .get_or_init(|| unsafe {
+            Library::new("/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight").ok()
         })
         .as_ref()
 }
@@ -183,7 +183,9 @@ pub fn set_enabled(id: DisplayID, enabled: bool) -> Result<(), String> {
         // logout. Safer than kCGConfigurePermanently for a daemon-style app.
         let complete = CGCompleteDisplayConfiguration(config, 1);
         if complete != 0 {
-            return Err(format!("CGCompleteDisplayConfiguration failed ({complete})"));
+            return Err(format!(
+                "CGCompleteDisplayConfiguration failed ({complete})"
+            ));
         }
         Ok(())
     }

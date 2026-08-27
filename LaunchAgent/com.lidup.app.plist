@@ -8,6 +8,5 @@
         <string>/Applications/lidup.app/Contents/MacOS/lidup</string>
     </array>
     <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
 </dict>
 </plist>

@@ -51,6 +51,8 @@ When running, the menu bar icon (`lidup`) shows:
   the built-in is restored.
 - **Per-display toggles** — one checkable item per display (`▶ on` / `■ off`). Toggle
   any display on or off, including the built-in.
+- **Start at Login** — a checkable item that installs/removes a per-user LaunchAgent
+  so lidup launches automatically at login (pointed at the currently running binary).
 - **Quit** — restores the built-in display, then exits.
 
 To select which external display to bind, open the menu → **Auto-off built-in when
@@ -81,20 +83,38 @@ The tray app can also be run directly (it will show a Dock icon unless bundled):
 `lidup` also accepts a subcommand for scripting/diagnostics:
 
 ```sh
-lidup list      # enumerate displays + current on/off state + identity keys
-lidup selftest  # turn the built-in off/on to prove the API works (always restores)
-lidup recover   # force the built-in back on (useful if the screen got stuck dark)
+lidup list                     # enumerate displays + state + identity keys
+lidup selftest                 # turn the built-in off/on (always restores)
+lidup recover                  # force the built-in back on (if the screen is dark)
+lidup autostart                # print whether launch-at-login is enabled
+lidup autostart on|off         # enable / disable (installs a LaunchAgent)
 ```
 
 ---
 
 ## Launch at login
 
-After `./pack.sh`, optionally install a LaunchAgent:
+- **From the tray**: tick **Start at Login** (installs a LaunchAgent pointing at the
+  currently running binary).
+- **From the CLI**: `lidup autostart on` / `lidup autostart off`.
+
+The manual script below is an optional fallback that installs a LaunchAgent for the
+bundled `/Applications/lidup.app`:
 
 ```sh
 ./install-launchagent.sh        # copies the app to /Applications and loads the agent
 ```
+
+---
+
+## CI
+
+`.github/workflows/build.yml` runs on every push/PR and on releases:
+
+1. `cargo fmt --check`, `cargo build`, `cargo test`
+2. release build + `./pack.sh` to produce `lidup.app`
+3. uploads `lidup` and `lidup.app` as a workflow artifact (and as a release asset on
+   tagged releases)
 
 ---
 
@@ -119,13 +139,15 @@ After `./pack.sh`, optionally install a LaunchAgent:
 
 ```
 src/
-  lib.rs        # crate root (library: displays, config, auto)
-  displays.rs   # CoreGraphics enumeration + SkyLight private on/off (dlsym)
-  config.rs     # JSON settings
-  auto.rs       # the auto-off rule (unit-testable)
-  main.rs       # menu-bar app (winit event loop + tray-icon/muda menu + worker)
-  bin/autotest.rs # CLI end-to-end check of the auto-off rule
-pack.sh         # build + bundle as lidup.app
+  lib.rs            # crate root (library: displays, config, auto, launch_agent)
+  displays.rs       # CoreGraphics enumeration + SkyLight private on/off (dlsym)
+  config.rs         # JSON settings
+  auto.rs           # the auto-off rule (unit-testable)
+  launch_agent.rs   # launch-at-login LaunchAgent (install/remove/uninstall)
+  main.rs           # menu-bar app (winit event loop + tray-icon/muda menu + worker)
+  bin/autotest.rs   # CLI end-to-end check of the auto-off rule
+pack.sh             # build + bundle as lidup.app
 install-launchagent.sh
 LaunchAgent/com.lidup.app.plist
+.github/workflows/build.yml   # CI build / test / artifact
 ```

@@ -98,14 +98,20 @@ mod tests {
     #[test]
     fn bound_present_off_when_builtin_on() {
         let s = settings(Some("ext:1"), true);
-        let list = vec![disp(1, true, true, "builtin"), disp(2, false, true, "ext:1")];
+        let list = vec![
+            disp(1, true, true, "builtin"),
+            disp(2, false, true, "ext:1"),
+        ];
         assert_eq!(decide(&s, &list), Some((1, false)));
     }
 
     #[test]
     fn bound_present_leaves_off_builtin_alone() {
         let s = settings(Some("ext:1"), true);
-        let list = vec![disp(1, true, false, "builtin"), disp(2, false, true, "ext:1")];
+        let list = vec![
+            disp(1, true, false, "builtin"),
+            disp(2, false, true, "ext:1"),
+        ];
         assert_eq!(decide(&s, &list), None);
     }
 
@@ -126,7 +132,10 @@ mod tests {
     #[test]
     fn no_bound_is_noop() {
         let s = settings(None, true);
-        let list = vec![disp(1, true, true, "builtin"), disp(2, false, true, "ext:1")];
+        let list = vec![
+            disp(1, true, true, "builtin"),
+            disp(2, false, true, "ext:1"),
+        ];
         assert_eq!(decide(&s, &list), None);
     }
 

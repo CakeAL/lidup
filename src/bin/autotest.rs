@@ -13,7 +13,10 @@ fn main() {
     let builtin_id = builtin.id;
     let builtin_key = builtin.key.clone();
     println!("external: {} key={}", ext.name, ext.key);
-    println!("builtin:  name={} id={} key={} on={}", builtin.name, builtin_id, builtin_key, builtin.on);
+    println!(
+        "builtin:  name={} id={} key={} on={}",
+        builtin.name, builtin_id, builtin_key, builtin.on
+    );
 
     let mut settings = config::Settings {
         bound_key: Some(ext.key.clone()),
@@ -21,6 +24,7 @@ fn main() {
         poll_ms: 500,
         builtin_id: Some(builtin_id),
         builtin_key: Some(builtin.key.clone()),
+        ..config::Settings::default()
     };
 
     // 1) External present -> built-in should go off.
@@ -52,7 +56,10 @@ fn main() {
     println!("external absent (restore_builtin=true), applying auto-off...");
     auto::apply_auto_to(&settings, &only_builtin);
     std::thread::sleep(Duration::from_millis(900));
-    println!("  built-in on after external absent: {}", displays::is_on(builtin_id));
+    println!(
+        "  built-in on after external absent: {}",
+        displays::is_on(builtin_id)
+    );
 
     // 3) Explicit restore as a safety net so we never leave the screen dark.
     let _ = displays::set_enabled(builtin_id, true);

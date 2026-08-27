@@ -1,5 +1,7 @@
 #!/bin/bash
-# Install a LaunchAgent so lidup starts automatically at login.
+# Manual fallback to install a LaunchAgent so lidup starts at login.
+# The primary way to toggle this is the "Start at Login" item in the tray menu,
+# which points the agent at the currently running binary.
 # Requires the app to be at /Applications/lidup.app (or edit the path below).
 set -euo pipefail
 
@@ -28,7 +30,6 @@ cat > "$DESTSRC/com.lidup.app.plist" <<'PLIST'
         <string>/Applications/lidup.app/Contents/MacOS/lidup</string>
     </array>
     <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
 </dict>
 </plist>
 PLIST

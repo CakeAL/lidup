@@ -19,6 +19,8 @@ pub struct Settings {
     /// Stable identity key of the built-in display, used to keep its menu entry
     /// stable (same key whether it is on or off) so the tray menu isn't rebuilt.
     pub builtin_key: Option<String>,
+    /// True if lidup is set to launch at login (a LaunchAgent is installed).
+    pub launch_at_login: bool,
 }
 
 impl Default for Settings {
@@ -29,6 +31,7 @@ impl Default for Settings {
             restore_builtin: true,
             builtin_id: None,
             builtin_key: None,
+            launch_at_login: false,
         }
     }
 }
