@@ -11,7 +11,6 @@ use lidup::{auto, config, displays, launch};
 use config::Settings;
 use displays::DisplayInfo;
 use std::sync::mpsc;
-use std::time::Duration;
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
@@ -108,6 +107,15 @@ fn refresh(
     settings: &mut Settings,
     last_external: &mut Option<bool>,
 ) {
+    // auto = None means the user wants full manual control: do NOT touch the built-in
+    // at all (no auto-off, no auto-restore). Otherwise the app would fight the user —
+    // e.g. re-light the built-in after they closed the lid. Only in auto (bound)
+    // mode do we manage the built-in.
+    if settings.bound_key.is_none() {
+        let _ = proxy.send_event(UserEvent::Snapshot(snapshot(settings)));
+        return;
+    }
+
     let before_id = settings.builtin_id;
     let before_key = settings.builtin_key.clone();
 
@@ -115,23 +123,15 @@ fn refresh(
 
     let displays_now: Vec<DisplayInfo> = displays::online_displays();
     let has_external = displays_now.iter().any(|d| !d.builtin);
-    // "Online" is reliable for the built-in: when it is disabled it drops out of the
-    // online list. (Do NOT trust the `on` flag right after an unplug — the panel can
-    // be dark while CGDisplayIsActive reports it as active.)
     let builtin_online = displays_now.iter().any(|d| d.builtin);
     // A sleeping built-in means the lid is closed (or the Mac is asleep). Never touch
-    // it then — otherwise we'd flip the screen back on after the user closed the lid
-    // (this is the Dusk "only handle a *awake* built-in" rule).
+    // it then — otherwise we'd flip the screen back on after the user closed the lid.
     let builtin_asleep = displays_now.iter().any(|d| d.builtin && d.asleep);
-
-    // A physical unplug is a reliable transition: there was an external before, none
-    // now. Recover on it (fires once, never spams the config calls).
     let unplugged = matches!(last_external, Some(true)) && !has_external;
     *last_external = Some(has_external);
 
     // Recover the built-in when it is genuinely offline/disabled and there is no
-    // external that replaces it, OR right after an unplug — but never if the built-in
-    // is asleep (lid closed).
+    // external that replaces it, OR right after an unplug — but never if asleep.
     if !builtin_asleep && ((!has_external && !builtin_online) || unplugged) {
         displays::recover_builtin();
     }
@@ -153,18 +153,17 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
     }
 
     // Track whether an external was present last refresh, so we can detect the
-    // unplug transition reliably (fires recovery once, never spams config calls).
+    // unplug transition (fires recovery once, never spams config calls).
     let mut last_external: Option<bool> = None;
 
-    // Event-driven from display changes / user actions, PLUS a low-frequency
-    // watchdog (every 2s) that re-checks whether there's an external and the
-    // built-in is online. Physical cable unplugs don't always fire a CoreGraphics
-    // callback, so the watchdog is what guarantees the built-in recovers.
+    // Purely EVENT-DRIVEN: we block on `rx.recv()` and only wake when the system
+    // notifies us (via the CGDisplayRegisterReconfiguration callback, which posts
+    // WorkerEvent::DisplayChanged) or the user touches the menu. No polling loop.
     loop {
-        match rx.recv_timeout(Duration::from_millis(2000)) {
+        match rx.recv() {
             Ok(ev) => match ev {
                 WorkerEvent::DisplayChanged => {
-                    // A display was inserted/removed/powered; re-evaluate.
+                    // The system notified us that the display set changed.
                 }
                 WorkerEvent::Toggle(id) => {
                     // A manual toggle is an explicit user override: disable the
@@ -199,12 +198,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                     return;
                 }
             },
-            Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Watchdog: re-check the unplug transition / built-in recovery.
-                refresh(&proxy, &mut settings, &mut last_external);
-                continue;
-            }
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(_) => return, // channel closed (main thread ended)
         }
 
         refresh(&proxy, &mut settings, &mut last_external);
