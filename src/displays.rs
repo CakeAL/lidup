@@ -266,18 +266,22 @@ pub fn toggle_safe(id: DisplayID) -> Result<(), String> {
     set_enabled(id, !is_on(id))
 }
 
-/// Ensure at least one display stays lit: if every display is off, power the
-/// built-in (or main) display back on. Safe to call after any change.
+/// Ensure at least one display stays lit. If every display is off, power one back
+/// on. Because a powered-off built-in leaves the online list (and after unplugging
+/// the external the list can be empty), this falls back to scanning ids via
+/// [`recover_builtin`]. Safe to call after any change.
 pub fn ensure_one_on() {
     if active_count() > 0 {
         return;
     }
     let list = online_displays();
-    if let Some(b) = list.iter().find(|d| d.builtin) {
-        let _ = set_enabled(b.id, true);
-    } else if let Some(d) = list.first() {
+    if let Some(d) = list.first() {
         let _ = set_enabled(d.id, true);
+        return;
     }
+    // Nothing is online (e.g. the built-in is off and the external was unplugged):
+    // recover the built-in by scanning its id.
+    recover_builtin();
 }
 
 /// Best-effort restore of the built-in display, even if it is currently powered
