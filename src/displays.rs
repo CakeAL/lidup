@@ -166,14 +166,28 @@ pub fn builtin_probe(id: DisplayID) -> bool {
 }
 
 /// Power a display on (`true`) or off (`false`) via the private SkyLight API.
+/// Skips the call when the display is already in the requested state.
 pub fn set_enabled(id: DisplayID, enabled: bool) -> Result<(), String> {
-    let set = set_enabled_fn().ok_or_else(|| "private display control unavailable".to_string())?;
-
     // Skip if already in the desired state.
     if is_on(id) == enabled {
         return Ok(());
     }
+    configure_enabled(id, enabled)
+}
 
+/// Same as [`set_enabled`] but always issues the configuration call, even if the
+/// display reports that it is already in the requested state. Used for recovery,
+/// where `CGDisplayIsActive` can report the built-in as active while its panel is
+/// actually dark — in which case `set_enabled` would silently skip the wake.
+fn configure_enabled(id: DisplayID, enabled: bool) -> Result<(), String> {
+    configure_enabled_with(id, enabled, false)
+}
+
+/// `configure_enabled` but `permanent = true` applies `kCGConfigurePermanently`,
+/// which is more reliably accepted when re-enabling a display that was disabled and
+/// then the hardware set changed (e.g. right after an external was unplugged).
+fn configure_enabled_with(id: DisplayID, enabled: bool, permanent: bool) -> Result<(), String> {
+    let set = set_enabled_fn().ok_or_else(|| "private display control unavailable".to_string())?;
     unsafe {
         let mut config: CGDisplayConfigRef = std::ptr::null_mut();
         let begin = CGBeginDisplayConfiguration(&mut config);
@@ -185,9 +199,8 @@ pub fn set_enabled(id: DisplayID, enabled: bool) -> Result<(), String> {
             CGCancelDisplayConfiguration(config);
             return Err(format!("CGSConfigureDisplayEnabled failed ({ret})"));
         }
-        // kCGConfigureForSession = 1: applies to this session, auto-reverts at
-        // logout. Safer than kCGConfigurePermanently for a daemon-style app.
-        let complete = CGCompleteDisplayConfiguration(config, 1);
+        // 1 = kCGConfigureForSession (reverts at logout), 2 = kCGConfigurePermanently.
+        let complete = CGCompleteDisplayConfiguration(config, if permanent { 2 } else { 1 });
         if complete != 0 {
             return Err(format!(
                 "CGCompleteDisplayConfiguration failed ({complete})"
@@ -266,35 +279,42 @@ pub fn toggle_safe(id: DisplayID) -> Result<(), String> {
     set_enabled(id, !is_on(id))
 }
 
-/// Ensure at least one display stays lit. If every display is off, power one back
-/// on. Because a powered-off built-in leaves the online list (and after unplugging
-/// the external the list can be empty), this falls back to scanning ids via
-/// [`recover_builtin`]. Safe to call after any change.
+/// Ensure at least one display stays lit. If every display is off, force the
+/// built-in back on (a powered-off built-in leaves the online list, so we scan ids).
+/// Safe to call after any change. Only acts when *nothing* is lit — so it never
+/// fights a manual toggle while an external is still on.
 pub fn ensure_one_on() {
     if active_count() > 0 {
         return;
     }
-    let list = online_displays();
-    if let Some(d) = list.first() {
-        let _ = set_enabled(d.id, true);
-        return;
-    }
-    // Nothing is online (e.g. the built-in is off and the external was unplugged):
-    // recover the built-in by scanning its id.
     recover_builtin();
 }
 
-/// Best-effort restore of the built-in display, even if it is currently powered
-/// off (and therefore absent from the online list). Scans the low display ids.
+/// Force the built-in display back on, even if it is currently powered off (and
+/// thus absent from the online list). Scans the low display ids, issues a *forced*
+/// configuration call (ignoring a possibly-stale "active" report), and retries a few
+/// times — because a call right at an unplug transition can be rejected.
 pub fn recover_builtin() {
-    if let Some(b) = builtin_display() {
-        let _ = set_enabled(b.id, true);
+    // Find the built-in id: from the online list if it's there, else scan.
+    let bid = online_displays()
+        .iter()
+        .find(|d| d.builtin)
+        .map(|d| d.id)
+        .or_else(|| (1..=16u32).find(|&id| builtin_probe(id)));
+
+    let Some(bid) = bid else {
         return;
-    }
-    for id in 1..=16u32 {
-        if builtin_probe(id) {
-            let _ = set_enabled(id, true);
+    };
+
+    // Retry: a config change can be rejected mid-transition, but a short while later
+    // it sticks. Try session config a few times, then fall back to a permanent config
+    // (which is more reliably accepted when the hardware set just changed).
+    for _ in 0..4 {
+        let _ = configure_enabled_with(bid, true, false);
+        if is_on(bid) {
             return;
         }
+        std::thread::sleep(std::time::Duration::from_millis(300));
     }
+    let _ = configure_enabled_with(bid, true, true);
 }

@@ -96,40 +96,29 @@ fn snapshot(settings: &Settings) -> Box<Snapshot> {
 
 /// Re-evaluate the current display situation and publish a fresh snapshot.
 ///
-/// Recovery of the built-in display is driven by detecting that the **number of
-/// external displays decreased** (an external was unplugged) while nothing is lit —
-/// NOT by trusting a system callback, which doesn't always fire on a physical cable
-/// pull. This is the same idea BetterDisplay uses. Because a low-frequency watchdog
-/// re-checks the count, it recovers even mid-transition and never leaves the built-in
-/// stuck off. Crucially, a **manual toggle doesn't change the external count**, so it
-/// is never fought by this — no flicker when you turn the built-in off yourself.
-fn refresh(
-    proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
-    settings: &mut Settings,
-    last_external: &mut Option<usize>,
-) {
+/// Re-evaluate the current display situation and publish a fresh snapshot.
+///
+/// Recovery is **not** driven by a CoreGraphics callback (which doesn't always fire
+/// on a physical cable pull). Instead it's a hard safety check: if *nothing* is lit,
+/// force the built-in back on via [`displays::recover_builtin`] (which issues a forced
+/// config call and retries). This only fires when there is genuinely no lit display,
+/// so it never fights a manual toggle that still leaves an external on
+/// (`active_count >= 1` in that case) — no flicker.
+fn refresh(proxy: &winit::event_loop::EventLoopProxy<UserEvent>, settings: &mut Settings) {
     let before_id = settings.builtin_id;
     let before_key = settings.builtin_key.clone();
 
-    // How many external displays are plugged in right now?
-    let current_external = displays::online_displays()
-        .iter()
-        .filter(|d| !d.builtin)
-        .count();
-
-    // Was an external unplugged since the last check? On the first check we don't
-    // know (None), so only recover on a real 1 -> 0 (or higher -> lower) transition.
-    let external_removed = matches!(last_external, Some(prev) if *prev > current_external);
-    if let Some(existing) = last_external.as_mut() {
-        *existing = current_external;
-    } else {
-        *last_external = Some(current_external);
-    }
-
     auto::apply_auto(settings);
 
-    // Safety: an external was unplugged and everything went dark — wake the built-in.
-    if external_removed && displays::active_count() == 0 {
+    // BetterDisplay-style recovery: if there is *no external display online* and the
+    // built-in is not currently lit, force it back on. This is more reliable than a
+    // bare "nothing is lit" check (which can be fooled by a stale "active" report on
+    // the built-in right after an unplug). An external being present means we never
+    // fight a manual toggle-off of the built-in.
+    let displays_now = displays::online_displays();
+    let external_online = displays_now.iter().any(|d| !d.builtin);
+    let builtin_lit = displays_now.iter().any(|d| d.builtin && d.on);
+    if !external_online && !builtin_lit {
         displays::recover_builtin();
     }
 
@@ -149,14 +138,10 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
         let _ = settings.save();
     }
 
-    // Track how many external displays are plugged in, so we can detect a removal
-    // even without a reliable system callback. `None` = first evaluation, no baseline.
-    let mut last_external: Option<usize> = None;
-
     // Event-driven from display changes / user actions, PLUS a low-frequency
-    // watchdog (every 2s) that re-checks the external count. Physical cable unplugs
-    // don't always fire a CoreGraphics callback, so the watchdog is what guarantees
-    // the external-removal is noticed and the built-in recovers.
+    // watchdog (every 2s) that re-checks the "is anything lit?" safety. Physical
+    // cable unplugs don't always fire a CoreGraphics callback, so the watchdog is
+    // what guarantees the built-in recovers even without a reliable event.
     loop {
         match rx.recv_timeout(Duration::from_millis(2000)) {
             Ok(ev) => match ev {
@@ -197,15 +182,14 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                 }
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Watchdog: re-check the external count and recover the built-in if
-                // an external was unplugged and nothing is lit. Mostly a no-op.
-                refresh(&proxy, &mut settings, &mut last_external);
+                // Watchdog: re-check the "is anything lit?" safety. Mostly a no-op.
+                refresh(&proxy, &mut settings);
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
-        refresh(&proxy, &mut settings, &mut last_external);
+        refresh(&proxy, &mut settings);
     }
 }
 
