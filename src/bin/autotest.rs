@@ -43,6 +43,7 @@ fn main() {
         id: builtin_id,
         builtin: true,
         on: false,
+        asleep: false,
         vendor: builtin.vendor,
         model: builtin.model,
         serial: builtin.serial,

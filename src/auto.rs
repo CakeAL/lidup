@@ -79,6 +79,7 @@ mod tests {
             id,
             builtin,
             on,
+            asleep: false,
             vendor: 0,
             model: 0,
             serial: 0,

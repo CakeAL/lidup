@@ -54,6 +54,7 @@ extern "C" {
         callback: Option<ReconfigCallback>,
         user_info: *mut c_void,
     ) -> CGError;
+    fn CGDisplayIsAsleep(id: u32) -> i32;
 }
 
 /// A snapshot of one display.
@@ -62,6 +63,9 @@ pub struct DisplayInfo {
     pub id: DisplayID,
     pub builtin: bool,
     pub on: bool, // enabled / lit
+    /// True when the display is asleep (e.g. the lid is closed). A sleeping built-in
+    /// must NOT be force-lit — that's how the lid stays "off".
+    pub asleep: bool,
     #[allow(dead_code)]
     pub vendor: u32,
     #[allow(dead_code)]
@@ -120,6 +124,7 @@ fn describe(id: DisplayID) -> DisplayInfo {
     unsafe {
         let builtin = CGDisplayIsBuiltin(id) != 0;
         let on = CGDisplayIsActive(id) != 0;
+        let asleep = CGDisplayIsAsleep(id) != 0;
         let vendor = CGDisplayVendorNumber(id);
         let model = CGDisplayModelNumber(id);
         let serial = CGDisplaySerialNumber(id);
@@ -138,6 +143,7 @@ fn describe(id: DisplayID) -> DisplayInfo {
             id,
             builtin,
             on,
+            asleep,
             vendor,
             model,
             serial,

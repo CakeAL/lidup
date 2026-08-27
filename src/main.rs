@@ -72,6 +72,7 @@ fn snapshot(settings: &Settings) -> Box<Snapshot> {
                     id: bid,
                     builtin: true,
                     on: false,
+                    asleep: false,
                     vendor: 0,
                     model: 0,
                     serial: 0,
@@ -118,6 +119,10 @@ fn refresh(
     // online list. (Do NOT trust the `on` flag right after an unplug — the panel can
     // be dark while CGDisplayIsActive reports it as active.)
     let builtin_online = displays_now.iter().any(|d| d.builtin);
+    // A sleeping built-in means the lid is closed (or the Mac is asleep). Never touch
+    // it then — otherwise we'd flip the screen back on after the user closed the lid
+    // (this is the Dusk "only handle a *awake* built-in" rule).
+    let builtin_asleep = displays_now.iter().any(|d| d.builtin && d.asleep);
 
     // A physical unplug is a reliable transition: there was an external before, none
     // now. Recover on it (fires once, never spams the config calls).
@@ -125,9 +130,9 @@ fn refresh(
     *last_external = Some(has_external);
 
     // Recover the built-in when it is genuinely offline/disabled and there is no
-    // external that replaces it, OR right after an unplug (covers the built-in being
-    // reported online-but-dark just after the cable is pulled).
-    if (!has_external && !builtin_online) || unplugged {
+    // external that replaces it, OR right after an unplug — but never if the built-in
+    // is asleep (lid closed).
+    if !builtin_asleep && ((!has_external && !builtin_online) || unplugged) {
         displays::recover_builtin();
     }
 
