@@ -175,8 +175,16 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                     let _ = displays::toggle_safe(id);
                 }
                 WorkerEvent::SetBound(key) => {
+                    let going_to_manual = key.is_none();
                     settings.bound_key = key;
                     let _ = settings.save();
+                    // Switching to manual (None) ends the auto-off: if the built-in
+                    // was disabled by the auto rule, bring it back on now. Otherwise
+                    // it would stay off (a fully-disabled built-in doesn't even
+                    // recover on lid open, since it's software-disabled, not asleep).
+                    if going_to_manual {
+                        displays::recover_builtin();
+                    }
                 }
                 WorkerEvent::SetLaunchAtLogin(enabled) => {
                     if let Some(enabled) = enabled {
