@@ -20,8 +20,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleName</key><string>lidup</string>
     <key>CFBundleDisplayName</key><string>lidup</string>
     <key>CFBundleIdentifier</key><string>com.lidup.app</string>
-    <key>CFBundleVersion</key><string>0.1.0</string>
-    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>CFBundleVersion</key><string>0.1.1</string>
+    <key>CFBundleShortVersionString</key><string>0.1.1</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleExecutable</key><string>lidup</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
