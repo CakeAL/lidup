@@ -9,12 +9,14 @@
 
 use libloading::{Library, Symbol};
 use std::os::raw::c_void;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 pub type DisplayID = u32;
 
 type CGError = i32;
 type CGDisplayConfigRef = *mut c_void;
+
+type ReconfigCallback = unsafe extern "C" fn(u32, u32, *mut c_void);
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -48,6 +50,10 @@ extern "C" {
     fn CGBeginDisplayConfiguration(config: *mut CGDisplayConfigRef) -> CGError;
     fn CGCompleteDisplayConfiguration(config: CGDisplayConfigRef, option: u32) -> CGError;
     fn CGCancelDisplayConfiguration(config: CGDisplayConfigRef) -> CGError;
+    fn CGDisplayRegisterReconfigurationCallback(
+        callback: Option<ReconfigCallback>,
+        user_info: *mut c_void,
+    ) -> CGError;
 }
 
 /// A snapshot of one display.
@@ -197,5 +203,94 @@ pub fn set_builtin(on: bool) -> Result<(), String> {
         set_enabled(b.id, on)
     } else {
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Event-driven display-change notifications (replaces polling).
+// ---------------------------------------------------------------------------
+
+/// Handler invoked (on a background thread) whenever the display configuration
+/// changes (a display is inserted, removed, re-arranged, powered on/off, …).
+/// Stored globally (not thread-local) because CoreGraphics invokes the callback on
+/// its own internal thread, not the thread that registered the callback.
+static RECONFIG: OnceLock<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = OnceLock::new();
+
+extern "C" fn reconfig_trampoline(_display: u32, _flags: u32, _user: *mut c_void) {
+    // CoreGraphics callbacks run on a non-main thread; forward to the handler.
+    if let Some(lock) = RECONFIG.get() {
+        if let Some(h) = lock.lock().unwrap().as_ref() {
+            h();
+        }
+    }
+}
+
+/// Register a callback that fires whenever the display configuration changes.
+/// Use this to wake a worker thread on insert/remove/timeout instead of polling.
+pub fn register_reconfig_handler<F: Fn() + Send + Sync + 'static>(
+    handler: F,
+) -> Result<(), String> {
+    *RECONFIG.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(Box::new(handler));
+    let err = unsafe {
+        CGDisplayRegisterReconfigurationCallback(Some(reconfig_trampoline), std::ptr::null_mut())
+    };
+    if err == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "CGDisplayRegisterReconfigurationCallback failed ({err})"
+        ))
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Safety helpers: never leave every display dark.
+// ---------------------------------------------------------------------------
+
+/// Number of displays that are currently on (enabled/lit).
+pub fn active_count() -> usize {
+    online_displays().iter().filter(|d| d.on).count()
+}
+
+/// Whether turning a display off would leave at least one other display on.
+/// Returns `false` if this display is the only one currently lit.
+pub fn is_last_active(id: DisplayID) -> bool {
+    active_count() <= 1 && is_on(id)
+}
+
+/// Toggle a display on/off, but refuse to turn off the last lit display.
+pub fn toggle_safe(id: DisplayID) -> Result<(), String> {
+    if is_on(id) && is_last_active(id) {
+        return Err("refusing to turn off the last active display".to_string());
+    }
+    set_enabled(id, !is_on(id))
+}
+
+/// Ensure at least one display stays lit: if every display is off, power the
+/// built-in (or main) display back on. Safe to call after any change.
+pub fn ensure_one_on() {
+    if active_count() > 0 {
+        return;
+    }
+    let list = online_displays();
+    if let Some(b) = list.iter().find(|d| d.builtin) {
+        let _ = set_enabled(b.id, true);
+    } else if let Some(d) = list.first() {
+        let _ = set_enabled(d.id, true);
+    }
+}
+
+/// Best-effort restore of the built-in display, even if it is currently powered
+/// off (and therefore absent from the online list). Scans the low display ids.
+pub fn recover_builtin() {
+    if let Some(b) = builtin_display() {
+        let _ = set_enabled(b.id, true);
+        return;
+    }
+    for id in 1..=16u32 {
+        if builtin_probe(id) {
+            let _ = set_enabled(id, true);
+            return;
+        }
     }
 }

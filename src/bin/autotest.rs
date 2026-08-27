@@ -21,7 +21,6 @@ fn main() {
     let mut settings = config::Settings {
         bound_key: Some(ext.key.clone()),
         restore_builtin: true,
-        poll_ms: 500,
         builtin_id: Some(builtin_id),
         builtin_key: Some(builtin.key.clone()),
         ..config::Settings::default()

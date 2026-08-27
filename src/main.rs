@@ -11,7 +11,6 @@ use lidup::{auto, config, displays, launch};
 use config::Settings;
 use displays::DisplayInfo;
 use std::sync::mpsc;
-use std::time::Duration;
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
@@ -28,13 +27,18 @@ struct Snapshot {
     launch_at_login: bool,
 }
 
-/// Commands sent from the menu (event loop) to the worker thread.
-enum Command {
+/// Events that wake the worker thread. The worker is **event-driven**: it blocks
+/// until either the display configuration changes (a display is plugged in or
+/// unplugged) or the user performs a menu action. There is no periodic polling.
+enum WorkerEvent {
+    /// A display was inserted, removed, re-arranged or powered on/off.
+    DisplayChanged,
+    /// User toggled a display on/off from the menu.
     Toggle(u32),
+    /// User selected the external monitor to auto-off (or None).
     SetBound(Option<String>),
     /// Enable (`true`) / disable (`false`) launch-at-login. `None` = no change.
     SetLaunchAtLogin(Option<bool>),
-    Refresh,
     Quit,
 }
 
@@ -83,28 +87,56 @@ fn snapshot(settings: &Settings) -> Box<Snapshot> {
         displays: list,
         bound: settings.bound_key.clone(),
         control_ok: displays::control_available(),
-        // Reflect the actual LaunchAgent state (source of truth), not just the
-        // cached setting, so a change made out-of-band is shown correctly.
-        launch_at_login: launch::check_reg_status(),
+        // Use the cached flag (queried once at startup and refreshed only when the
+        // user toggles it) — we never call into SMAppService on every snapshot.
+        launch_at_login: settings.launch_at_login,
     })
 }
 
-fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receiver<Command>) {
+/// Re-apply the auto-off rule and the "at least one display lit" safety, then
+/// publish a fresh snapshot. Safe to call after any display change or command.
+fn refresh(proxy: &winit::event_loop::EventLoopProxy<UserEvent>, settings: &mut Settings) {
+    let before_id = settings.builtin_id;
+    let before_key = settings.builtin_key.clone();
+    auto::apply_auto(settings);
+    displays::ensure_one_on();
+    if settings.builtin_id != before_id || settings.builtin_key != before_key {
+        let _ = settings.save();
+    }
+    let _ = proxy.send_event(UserEvent::Snapshot(snapshot(settings)));
+}
+
+fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receiver<WorkerEvent>) {
     let mut settings = Settings::load();
+
+    // Sync the launch-at-login flag from the OS once at startup (we don't poll it).
+    let os_launch = launch::check_reg_status();
+    if settings.launch_at_login != os_launch {
+        settings.launch_at_login = os_launch;
+        let _ = settings.save();
+    }
+
+    // Block until the next event (display change or user action). No polling.
     loop {
-        // Wait for a command (or a poll timeout).
-        let command = rx.recv_timeout(Duration::from_millis(settings.poll_ms.max(300)));
-        match command {
-            Ok(cmd) => match cmd {
-                Command::Toggle(id) => {
-                    let on = displays::is_on(id);
-                    let _ = displays::set_enabled(id, !on);
+        match rx.recv() {
+            Ok(ev) => match ev {
+                WorkerEvent::DisplayChanged => {
+                    // A display was inserted/removed/powered; re-evaluate the rule.
                 }
-                Command::SetBound(key) => {
+                WorkerEvent::Toggle(id) => {
+                    // A manual toggle is an explicit user override: disable the
+                    // auto-off rule so it doesn't immediately fight the change.
+                    if settings.bound_key.is_some() {
+                        settings.bound_key = None;
+                        let _ = settings.save();
+                    }
+                    let _ = displays::toggle_safe(id);
+                }
+                WorkerEvent::SetBound(key) => {
                     settings.bound_key = key;
                     let _ = settings.save();
                 }
-                Command::SetLaunchAtLogin(enabled) => {
+                WorkerEvent::SetLaunchAtLogin(enabled) => {
                     if let Some(enabled) = enabled {
                         let result = if enabled {
                             launch::register()
@@ -117,29 +149,19 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         }
                     }
                 }
-                Command::Refresh => {}
-                Command::Quit => {
-                    // Restore the built-in display so the user isn't left with a dark screen.
-                    if let Some(bid) = settings.builtin_id {
-                        let _ = displays::set_enabled(bid, true);
-                    }
+                WorkerEvent::Quit => {
+                    // Restore the built-in display so the user isn't left dark.
+                    displays::recover_builtin();
                     let _ = proxy.send_event(UserEvent::Exit);
                     return;
                 }
             },
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(_) => return, // channel closed (main thread ended)
         }
 
-        // Re-apply the auto-off rule (may refresh the cached built-in id/key),
-        // persist if they changed, then publish the current state.
-        let before_id = settings.builtin_id;
-        let before_key = settings.builtin_key.clone();
-        auto::apply_auto(&mut settings);
-        if settings.builtin_id != before_id || settings.builtin_key != before_key {
-            let _ = settings.save();
-        }
-        let _ = proxy.send_event(UserEvent::Snapshot(snapshot(&settings)));
+        // After any event: apply the auto rule + keep at least one display lit,
+        // then push the fresh state to the UI.
+        refresh(&proxy, &mut settings);
     }
 }
 
@@ -277,7 +299,7 @@ impl MenuState {
 // ---------------------------------------------------------------------------
 
 struct App {
-    cmd_tx: mpsc::Sender<Command>,
+    cmd_tx: mpsc::Sender<WorkerEvent>,
     tray: Option<TrayIcon>,
     menu: Option<MenuState>,
     snapshot: Option<Snapshot>,
@@ -321,22 +343,28 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Menu(ev) => {
                 let id = ev.id();
                 if id == "quit" {
-                    let _ = self.cmd_tx.send(Command::Quit);
-                } else if id == "refresh" {
-                    let _ = self.cmd_tx.send(Command::Refresh);
+                    let _ = self.cmd_tx.send(WorkerEvent::Quit);
                 } else if id == "start-login" {
-                    let enabled = launch::check_reg_status();
-                    let _ = self.cmd_tx.send(Command::SetLaunchAtLogin(Some(!enabled)));
+                    // Toggle based on the state shown in the menu (cached), so the
+                    // action matches the checkmark. No SMAppService query per click.
+                    let enabled = self
+                        .snapshot
+                        .as_ref()
+                        .map(|s| s.launch_at_login)
+                        .unwrap_or(false);
+                    let _ = self
+                        .cmd_tx
+                        .send(WorkerEvent::SetLaunchAtLogin(Some(!enabled)));
                 } else if let Some(key) = id.as_ref().strip_prefix("bind:") {
                     let key = if key == "none" {
                         None
                     } else {
                         Some(key.to_string())
                     };
-                    let _ = self.cmd_tx.send(Command::SetBound(key));
+                    let _ = self.cmd_tx.send(WorkerEvent::SetBound(key));
                 } else if let Some(sid) = id.as_ref().strip_prefix("toggle:") {
                     if let Ok(did) = sid.parse::<u32>() {
-                        let _ = self.cmd_tx.send(Command::Toggle(did));
+                        let _ = self.cmd_tx.send(WorkerEvent::Toggle(did));
                     }
                 }
             }
@@ -493,6 +521,23 @@ fn cli() -> bool {
     }
 }
 
+/// If lidup is terminated (SIGTERM/SIGINT/SIGHUP — e.g. the OS kills the login
+/// item when it is unticked in System Settings, or the app is quit externally),
+/// restore the built-in display so the user is never left with a dark screen.
+/// The handle runs on its own thread (event-driven via a self-pipe, no polling).
+fn install_exit_guard() {
+    use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
+    use signal_hook::iterator::Signals;
+    std::thread::spawn(move || {
+        if let Ok(mut signals) = Signals::new([SIGHUP, SIGINT, SIGTERM]) {
+            if signals.forever().next().is_some() {
+                displays::recover_builtin();
+                std::process::exit(0);
+            }
+        }
+    });
+}
+
 /// Hide the Dock icon so lidup runs purely in the menu bar. Must run on the main
 /// thread before the app's event loop starts.
 fn set_menu_bar_only() {
@@ -526,10 +571,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = menu_proxy.send_event(UserEvent::Menu(event));
     }));
 
-    let (cmd_tx, cmd_rx) = mpsc::channel();
+    // Event-driven worker: wake it on display changes and on manual actions.
+    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerEvent>();
+
+    // Fire whenever a display is inserted/removed/powered — forwards to the worker.
+    let reconfig_tx = cmd_tx.clone();
+    let _ = displays::register_reconfig_handler(move || {
+        let _ = reconfig_tx.send(WorkerEvent::DisplayChanged);
+    });
+
     std::thread::Builder::new()
         .name("lidup-worker".into())
         .spawn(move || worker(proxy, cmd_rx))?;
+
+    // Evaluate once on launch (applies the auto rule to the current state and
+    // publishes the first snapshot) so the menu is populated immediately.
+    let _ = cmd_tx.send(WorkerEvent::DisplayChanged);
+
+    // If this process is terminated (e.g. the OS kills the login item when it is
+    // unticked in System Settings), make sure the built-in display comes back on.
+    install_exit_guard();
 
     let mut app = App {
         cmd_tx,

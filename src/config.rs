@@ -8,8 +8,6 @@ pub struct Settings {
     /// Stable `vendor:model:serial` key of the external display that, when
     /// connected, auto-turns-off the built-in display. `None` disables auto-off.
     pub bound_key: Option<String>,
-    /// Refresh/automatic check interval in milliseconds.
-    pub poll_ms: u64,
     /// Start the built-in display automatically whenever the bound display is
     /// absent (i.e. undo an auto-off). Defaults to true.
     pub restore_builtin: bool,
@@ -27,7 +25,6 @@ impl Default for Settings {
     fn default() -> Self {
         Settings {
             bound_key: None,
-            poll_ms: 1500,
             restore_builtin: true,
             builtin_id: None,
             builtin_key: None,
