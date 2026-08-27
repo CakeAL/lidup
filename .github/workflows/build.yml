@@ -44,7 +44,20 @@ jobs:
       - name: Build (release)
         run: cargo build --release
 
+      - name: Import signing certificate (into keychain)
+        if: ${{ secrets.CERTIFICATE_P12_BASE64 != '' }}
+        uses: apple-actions/import-codesign-certs@v2
+        with:
+          p12-file-base64: ${{ secrets.CERTIFICATE_P12_BASE64 }}
+          p12-password: ${{ secrets.CERTIFICATE_PASSWORD }}
+
       - name: Build .app bundle
+        env:
+          # Read from Actions secrets — never hard-code these in the repo.
+          DEVELOPER_ID: ${{ secrets.DEVELOPER_ID }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: ./pack.sh
 
       - name: Upload artifacts

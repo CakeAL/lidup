@@ -31,8 +31,30 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Ad-hoc sign so the bundle is treated as a proper app and can be run/launched at login.
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "!! codesign skipped/ad-hoc sign failed (optional)"
+# Sign the bundle.
+#  - If $DEVELOPER_ID is set, sign with that Developer ID identity (Hardened Runtime)
+#    and, if notarization creds are present, notarize + staple.
+#  - Otherwise fall back to an ad-hoc signature (local dev only).
+if [ -n "${DEVELOPER_ID:-}" ]; then
+    echo "==> Signing with Developer ID: ${DEVELOPER_ID}"
+    codesign --force --deep --options runtime --sign "$DEVELOPER_ID" "$APP" || {
+        echo "!! codesign failed with '$DEVELOPER_ID'" >&2; exit 1
+    }
+    # Notarize if credentials are provided (used by CI).
+    if [ -n "${APPLE_ID:-}" ] && [ -n "${APPLE_TEAM_ID:-}" ] && [ -n "${APPLE_APP_PASSWORD:-}" ]; then
+        echo "==> Notarizing..."
+        ditto -c -k --keepParent "$APP" "$APP.zip"
+        xcrun notarytool submit "$APP.zip" --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait || {
+            echo "!! notarization failed" >&2; exit 1
+        }
+        xcrun stapler staple "$APP" || true
+        rm -f "$APP.zip"
+    fi
+else
+    echo "==> Ad-hoc signing (local dev). Set DEVELOPER_ID for a real signature."
+    codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "!! ad-hoc codesign failed (optional)"
+fi
 
 echo
 echo "Built: $APP"

@@ -1,170 +1,56 @@
 # lidup
 
-A tiny macOS **menu-bar** app written in Rust that turns off the MacBook's **built-in
-display** when a chosen external display is connected, and turns it back on when the
-trigger is unplugged. It also exposes a per-display **on/off toggle** for every display.
+一个 macOS **菜单栏（托盘）小工具**，用 Rust 编写。
 
-It answers the use case from
-[V2EX t/1123499](https://www.v2ex.com/t/1123499): *"不合盖使用外接显示器如何彻底关闭内置显示器"*
-(close the built-in screen without closing the lid).
+它的作用：当你连接了一块**指定的外接显示器**时，自动**关闭 MacBook 的内建显示器**；当你**拔掉它**时，自动把内建显示器**点亮**。同时也可以在托盘菜单里**手动开关任意一块显示器**（内建或外接）。
 
 ---
 
-## How it works
+## 使用
 
-- **Enumerate / identify / geometry** — the *public* CoreGraphics API
-  (`CGGetOnlineDisplayList`, `CGDisplayIsBuiltin`, `CGDisplayIsActive`,
-  `CGDisplayVendorNumber`, `CGDisplayModelNumber`, `CGDisplaySerialNumber`,
-  `CGDisplayBounds`).
-- **Actually power a display off/on** — the *private* SkyLight symbol
-  `CGSConfigureDisplayEnabled(config, displayID, enabled)` loaded at runtime via
-  `dlopen`/`dlsym`, wrapped in a
-  `CGBeginDisplayConfiguration` → `CGSConfigureDisplayEnabled` →
-  `CGCompleteDisplayConfiguration(_, kCGConfigureForSession)` transaction. This is
-  the same technique used by `displayplacer` and the script described in the V2EX
-  thread. It is loaded dynamically so the app degrades gracefully if the symbol ever
-  moves.
+### 构建并运行
 
-  > The public CoreGraphics header contains no `CGConfigureDisplayEnabled` — the
-  > working symbol lives in the private `SkyLight` framework (verified on macOS 26/27
-  > Apple Silicon here).
-
-- **Recovery drives off the external count, not a callback** — lidup watches the
-  **number of external displays**. When that number decreases (an external was
-  unplugged) and nothing is left lit, it re-powers the built-in. This is the same
-  approach BetterDisplay uses and does **not** depend on a CoreGraphics
-  reconfiguration callback, which doesn't always fire on a physical cable pull. A
-  low-frequency watchdog re-checks the count every ~2s, so it recovers even
-  mid-transition and never leaves the built-in stuck off. Because a manual toggle
-  does **not** change the external count, it is never fought by this — no flicker.
-
-- **Config persistence** — JSON in `~/Library/Application Support/lidup/config.json`:
-  the bound external display key (`vendor:model:serial`), whether to restore the
-  built-in when the trigger is unplugged, and the cached built-in id/key.
-
-### Behaviour rules
-
-- **External unplugged** → the built-in display is restored (auto or not).
-- **Bound external plugged in** → the built-in display is turned off.
-- **Manual toggle of any display** → the auto-off rule is set to `None` so it never
-  fights your manual change (and the removal-detection never re-powers a display you
-  turned off yourself, since it only reacts to the external count changing).
-- **Menu stays in sync with hot-plug** — the display list rebuilds whenever a monitor
-  is actually plugged in/unplugged (the menu is updated in place for mere state
-  changes like on/off, and only fully rebuilt on a real structural change).
-- **Safety:** lidup re-powers the built-in if you unplug the last external and
-  nothing is lit — no dark screen.
-- **If the app is terminated** (e.g. the OS kills the login item when it is unticked
-  in System Settings), lidup restores the built-in display before exiting.
-
----
-
-## Menu bar
-
-When running, the menu bar icon (`lidup`) shows:
-
-- **Auto-off built-in when connected** — a submenu that lists every *external*
-  display. Mark the one that should close the built-in (or "None" for manual control).
-  While that display is plugged in, the built-in is force-off; when it is unplugged,
-  the built-in is restored.
-- **Per-display toggles** — one checkable item per display (`▶ on` / `■ off`). Toggle
-  any display on or off, including the built-in.
-- **Start at Login** — a checkable item that registers lidup as a login item via
-  Apple's `SMAppService` framework, so it launches automatically at login. Tick it to
-  register, untick to remove.
-- **Quit** — restores the built-in display, then exits.
-
-To select which external display to bind, open the menu → **Auto-off built-in when
-connected** → click the display.
-
----
-
-## Build & run
-
-Requires the **Xcode command line tools** and the **Rust** toolchain.
+需要安装 Xcode 命令行工具和 Rust 工具链。
 
 ```sh
-# build the menu-bar app bundle (no Dock icon)
-./pack.sh
-
-# run it
-open target/release/lidup.app
+./pack.sh                       # 打包成菜单栏应用（无 Dock 图标）
+open target/release/lidup.app   # 运行
 ```
 
-The tray app can also be run directly (it will show a Dock icon unless bundled):
+也可以直接跑命令行二进制（会显示 Dock 图标）：
 
 ```sh
-./target/release/lidup
+cargo run --release
 ```
 
-### Command-line helpers
+### 托盘菜单
 
-`lidup` also accepts a subcommand for scripting/diagnostics:
+运行后，右上角菜单栏会出现 lidup 图标，菜单包含：
+
+- **Auto-off built-in when connected** — 选择哪块外接显示器作为「自动关闭内建屏」的触发显示器（选 None 则关闭自动功能）。选中后：
+  - 插入该外接显示器 → 自动关闭内建屏；
+  - 拔掉该外接显示器 → 自动点亮内建屏。
+- **每块显示器的开关**（`▶ on` / `■ off`）— 手动开关任意显示器。
+- **Start at Login** — 开机自启（注册登录项）。
+- **Quit** — 退出，并恢复内建显示器。
+
+### 命令行辅助
 
 ```sh
-lidup list                     # enumerate displays + state + identity keys
-lidup selftest                 # turn the built-in off/on (always restores)
-lidup recover                  # force the built-in back on (if the screen is dark)
-lidup autostart                # print whether launch-at-login is enabled
-lidup autostart on|off         # enable / disable (SMAppService login item)
+lidup list                  # 查看当前显示器及开关状态
+lidup selftest              # 把内建屏关-开一次自检（结束后会恢复）
+lidup recover               # 强制把内建屏点亮
+lidup autostart on|off      # 开关开机自启
 ```
 
 ---
 
-## Launch at login
+## 说明
 
-- **From the tray**: tick **Start at Login** (registers via `SMAppService`).
-- **From the CLI**: `lidup autostart on` / `lidup autostart off`.
+- 「自动关闭」只在选择绑定某块外接屏后生效；绑定显示器插上时内建屏保持关闭，拔掉时自动点亮。
+- 你在菜单里**手动**开关某一台显示器后，自动功能会被置为 `None`，不再干扰你的手动操作。
+- 为安全起见，lidup 不会让所有显示器同时熄灭——总会保证至少有一块是点亮的。
 
-> **Important:** `SMAppService` requires the caller to be running inside a
-> code-signed `.app` bundle. Running the bare `target/release/lidup` binary (not the
-> `.app`) will refuse to register, and will tell you so. Use `open target/release/lidup.app`
-> and tick **Start at Login** there. On first register macOS may prompt you — approve it
-> in **System Settings → General → Login Items**. (The bundle is ad-hoc signed; for the
-> registration to be trusted/auto-approved by SMAppService across reboots you usually need
-> a real Developer ID signature.)
+## 配置
 
----
-
-## CI
-
-`.github/workflows/build.yml` runs on every push/PR and on releases:
-
-1. `cargo fmt --check`, `cargo build`, `cargo test`
-2. release build + `./pack.sh` to produce `lidup.app`
-3. uploads `lidup` and `lidup.app` as a workflow artifact (and as a release asset on
-   tagged releases)
-
----
-
-## Notes & limitations
-
-- **Private API**: `CGSConfigureDisplayEnabled` is undocumented. It works on modern
-  macOS (tested on macOS 27 / Apple Silicon), but a future macOS release could remove
-  or rename it. In that case lidup simply shows *"Display control unavailable"* in the
-  menu instead of crashing.
-- **Auto-off is enforced** while the bound external is connected: if you manually
-  turn the built-in back on in the menu, the auto rule switches it off again on the
-  next cycle. This is the intended "close while external is connected" behaviour.
-- Only **one** external display can be bound as the auto-off trigger.
-- The menu labels external displays as `External Display <vendor-hex>-<model-hex>`
-  because modern macOS exposes no friendly per-display name through public/private
-  CoreGraphics on Apple Silicon (the vendor/model hex is stable and distinguishes
-  different monitors).
-
----
-
-## Project layout
-
-```
-src/
-  lib.rs            # crate root (library: displays, config, auto, launch)
-  displays.rs       # CoreGraphics enumeration + SkyLight private on/off (dlsym)
-  config.rs         # JSON settings
-  auto.rs           # the auto-off rule (unit-testable)
-  launch.rs         # launch-at-login via SMAppService (smappservice-rs)
-  main.rs           # menu-bar app (winit event loop + tray-icon/muda menu + worker)
-  bin/autotest.rs   # CLI end-to-end check of the auto-off rule
-pack.sh             # build + bundle as lidup.app
-.github/workflows/build.yml   # CI build / test / artifact
-```
+设置保存在 `~/Library/Application Support/lidup/config.json`（可用 `LIDUP_CONFIG` 环境变量改路径）。
