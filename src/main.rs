@@ -230,19 +230,22 @@ fn toggle_label(d: &DisplayInfo) -> String {
     )
 }
 
-/// A persistent set of menu items, built **once** and never replaced. Item state
-/// (checked / label) is mutated in place on each snapshot. Rebuilding the tray
-/// menu (`set_menu`) on macOS while the user interacts with it is what caused the
-/// click-crash (muda #173), so we deliberately never replace it after startup.
-/// Consequently newly-hot-plugged displays appear only after an app restart; the
-/// auto-off rule and per-display toggles still work for the displays seen at start.
+/// The set of menu items currently shown. **Structural identity** (which displays
+/// are present, in order, plus the bound selection) is tracked via `signature`.
+///
+/// - While the signature is unchanged (a display on/off state or bound selection
+///   changed) we mutate the existing items' checked/label **in place** — no rebuild,
+///   so an open menu is never torn down and clicking stays safe (muda #173).
+/// - When the signature changes (a display was plugged in or unplugged) we signal the
+///   caller to **rebuild** the whole menu. This happens only on real hot-plug (rare,
+///   and almost never while you're clicking it).
 struct MenuState {
-    #[allow(dead_code)]
     menu: Menu,
     bind_none: CheckMenuItem,
     bind_items: Vec<(String, CheckMenuItem)>,
     toggle_items: Vec<(u32, CheckMenuItem)>,
     start_login: CheckMenuItem,
+    signature: String,
 }
 
 impl MenuState {
@@ -317,11 +320,20 @@ impl MenuState {
             bind_items,
             toggle_items,
             start_login,
+            signature: structural_signature(snap),
         }
     }
 
-    /// Update item state against a fresh snapshot (in place — no menu rebuild).
-    fn update(&mut self, snap: &Snapshot) {
+    /// Update item state against a fresh snapshot. Returns `true` only when the
+    /// structural identity changed (a display was plugged in/unplugged), meaning the
+    /// caller must rebuild the menu. Otherwise updates items in place.
+    fn update(&mut self, snap: &Snapshot) -> bool {
+        let sig = structural_signature(snap);
+        if sig != self.signature {
+            return true;
+        }
+        self.signature = sig;
+
         self.bind_none.set_checked(snap.bound.is_none());
         for (key, item) in &self.bind_items {
             item.set_checked(snap.bound.as_deref() == Some(key.as_str()));
@@ -335,7 +347,19 @@ impl MenuState {
             }
         }
         self.start_login.set_checked(snap.launch_at_login);
+        false
     }
+}
+
+/// Stable identity of the display list: the ordered set of display ids + keys.
+/// When this changes, a display was truly plugged in / unplugged. The bound
+/// selection is *not* part of it (rebinding only flips a checkmark, handled in place).
+fn structural_signature(snap: &Snapshot) -> String {
+    let mut s = String::new();
+    for d in &snap.displays {
+        s.push_str(&format!("{},{},{};", d.id, d.builtin as u8, d.key));
+    }
+    s
 }
 
 // ---------------------------------------------------------------------------
@@ -372,15 +396,25 @@ impl ApplicationHandler<UserEvent> for App {
         match event {
             UserEvent::Snapshot(snap) => {
                 let snap = *snap;
-                if let Some(ms) = self.menu.as_mut() {
-                    // In-place update only; never call set_menu again after startup.
-                    ms.update(&snap);
-                } else {
-                    let first = MenuState::build(&snap);
-                    if let Some(tray) = &self.tray {
-                        tray.set_menu(Some(Box::new(first.menu.clone())));
+                let rebuild = match self.menu.as_mut() {
+                    // In-place update; returns true only when the display list really
+                    // changed (hot-plug), which is when we rebuild the menu.
+                    Some(ms) => ms.update(&snap),
+                    None => {
+                        let first = MenuState::build(&snap);
+                        if let Some(tray) = &self.tray {
+                            tray.set_menu(Some(Box::new(first.menu.clone())));
+                        }
+                        self.menu = Some(first);
+                        false
                     }
-                    self.menu = Some(first);
+                };
+                if rebuild {
+                    let fresh = MenuState::build(&snap);
+                    if let Some(tray) = &self.tray {
+                        tray.set_menu(Some(Box::new(fresh.menu.clone())));
+                    }
+                    self.menu = Some(fresh);
                 }
                 self.snapshot = Some(snap);
             }

@@ -49,6 +49,9 @@ It answers the use case from
 - **Manual toggle of any display** → the auto-off rule is set to `None` so it never
   fights your manual change (and the removal-detection never re-powers a display you
   turned off yourself, since it only reacts to the external count changing).
+- **Menu stays in sync with hot-plug** — the display list rebuilds whenever a monitor
+  is actually plugged in/unplugged (the menu is updated in place for mere state
+  changes like on/off, and only fully rebuilt on a real structural change).
 - **Safety:** lidup re-powers the built-in if you unplug the last external and
   nothing is lit — no dark screen.
 - **If the app is terminated** (e.g. the OS kills the login item when it is unticked
