@@ -6,7 +6,7 @@
 //! auto-off rule and pushes a snapshot to the winit event loop, which renders the
 //! menu-bar menu. Menu item ids are turned into commands on the worker thread.
 
-use lidup::{auto, config, displays, launch_agent};
+use lidup::{auto, config, displays, launch};
 
 use config::Settings;
 use displays::DisplayInfo;
@@ -85,7 +85,7 @@ fn snapshot(settings: &Settings) -> Box<Snapshot> {
         control_ok: displays::control_available(),
         // Reflect the actual LaunchAgent state (source of truth), not just the
         // cached setting, so a change made out-of-band is shown correctly.
-        launch_at_login: launch_agent::is_installed(),
+        launch_at_login: launch::check_reg_status(),
     })
 }
 
@@ -107,9 +107,9 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                 Command::SetLaunchAtLogin(enabled) => {
                     if let Some(enabled) = enabled {
                         let result = if enabled {
-                            launch_agent::install()
+                            launch::register()
                         } else {
-                            launch_agent::uninstall()
+                            launch::unregister()
                         };
                         if result.is_ok() {
                             settings.launch_at_login = enabled;
@@ -325,7 +325,7 @@ impl ApplicationHandler<UserEvent> for App {
                 } else if id == "refresh" {
                     let _ = self.cmd_tx.send(Command::Refresh);
                 } else if id == "start-login" {
-                    let enabled = launch_agent::is_installed();
+                    let enabled = launch::check_reg_status();
                     let _ = self.cmd_tx.send(Command::SetLaunchAtLogin(Some(!enabled)));
                 } else if let Some(key) = id.as_ref().strip_prefix("bind:") {
                     let key = if key == "none" {
@@ -432,7 +432,7 @@ fn cli() -> bool {
                 displays::control_available()
             );
             println!("bound external key: {:?}", settings.bound_key);
-            println!("launch at login: {}", launch_agent::is_installed());
+            println!("launch at login: {}", launch::check_reg_status());
             for d in displays::online_displays() {
                 let role = if d.builtin { "built-in" } else { "external" };
                 println!(
@@ -445,15 +445,15 @@ fn cli() -> bool {
         "autostart" => {
             // `autostart` shows status; `autostart on|off` enables/disables.
             match args.get(2).map(String::as_str) {
-                Some("on") => match launch_agent::install() {
+                Some("on") => match launch::register() {
                     Ok(()) => println!("launch-at-login enabled"),
                     Err(e) => println!("failed to enable launch-at-login: {e}"),
                 },
-                Some("off") => match launch_agent::uninstall() {
+                Some("off") => match launch::unregister() {
                     Ok(()) => println!("launch-at-login disabled"),
                     Err(e) => println!("failed to disable launch-at-login: {e}"),
                 },
-                _ => println!("launch-at-login: {}", launch_agent::is_installed()),
+                _ => println!("launch-at-login: {}", launch::check_reg_status()),
             }
             true
         }

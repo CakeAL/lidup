@@ -4,4 +4,4 @@
 pub mod auto;
 pub mod config;
 pub mod displays;
-pub mod launch_agent;
+pub mod launch;

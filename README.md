@@ -51,8 +51,9 @@ When running, the menu bar icon (`lidup`) shows:
   the built-in is restored.
 - **Per-display toggles** — one checkable item per display (`▶ on` / `■ off`). Toggle
   any display on or off, including the built-in.
-- **Start at Login** — a checkable item that installs/removes a per-user LaunchAgent
-  so lidup launches automatically at login (pointed at the currently running binary).
+- **Start at Login** — a checkable item that registers lidup as a login item via
+  Apple's `SMAppService` framework, so it launches automatically at login. Tick it to
+  register, untick to remove.
 - **Quit** — restores the built-in display, then exits.
 
 To select which external display to bind, open the menu → **Auto-off built-in when
@@ -87,23 +88,23 @@ lidup list                     # enumerate displays + state + identity keys
 lidup selftest                 # turn the built-in off/on (always restores)
 lidup recover                  # force the built-in back on (if the screen is dark)
 lidup autostart                # print whether launch-at-login is enabled
-lidup autostart on|off         # enable / disable (installs a LaunchAgent)
+lidup autostart on|off         # enable / disable (SMAppService login item)
 ```
 
 ---
 
 ## Launch at login
 
-- **From the tray**: tick **Start at Login** (installs a LaunchAgent pointing at the
-  currently running binary).
+- **From the tray**: tick **Start at Login** (registers via `SMAppService`).
 - **From the CLI**: `lidup autostart on` / `lidup autostart off`.
 
-The manual script below is an optional fallback that installs a LaunchAgent for the
-bundled `/Applications/lidup.app`:
-
-```sh
-./install-launchagent.sh        # copies the app to /Applications and loads the agent
-```
+> **Important:** `SMAppService` requires the caller to be running inside a
+> code-signed `.app` bundle. Running the bare `target/release/lidup` binary (not the
+> `.app`) will refuse to register, and will tell you so. Use `open target/release/lidup.app`
+> and tick **Start at Login** there. On first register macOS may prompt you — approve it
+> in **System Settings → General → Login Items**. (The bundle is ad-hoc signed; for the
+> registration to be trusted/auto-approved by SMAppService across reboots you usually need
+> a real Developer ID signature.)
 
 ---
 
@@ -139,15 +140,13 @@ bundled `/Applications/lidup.app`:
 
 ```
 src/
-  lib.rs            # crate root (library: displays, config, auto, launch_agent)
+  lib.rs            # crate root (library: displays, config, auto, launch)
   displays.rs       # CoreGraphics enumeration + SkyLight private on/off (dlsym)
   config.rs         # JSON settings
   auto.rs           # the auto-off rule (unit-testable)
-  launch_agent.rs   # launch-at-login LaunchAgent (install/remove/uninstall)
+  launch.rs         # launch-at-login via SMAppService (smappservice-rs)
   main.rs           # menu-bar app (winit event loop + tray-icon/muda menu + worker)
   bin/autotest.rs   # CLI end-to-end check of the auto-off rule
 pack.sh             # build + bundle as lidup.app
-install-launchagent.sh
-LaunchAgent/com.lidup.app.plist
 .github/workflows/build.yml   # CI build / test / artifact
 ```
