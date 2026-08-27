@@ -6,22 +6,8 @@
 
 ---
 
-## 使用
-
-### 构建并运行
-
-需要安装 Xcode 命令行工具和 Rust 工具链。
-
-```sh
-./pack.sh                       # 打包成菜单栏应用（无 Dock 图标）
-open target/release/lidup.app   # 运行
-```
-
-也可以直接跑命令行二进制（会显示 Dock 图标）：
-
-```sh
-cargo run --release
-```
+## 下载
+https://github.com/CakeAL/lidup/releases
 
 ### 托盘菜单
 
@@ -54,3 +40,20 @@ lidup autostart on|off      # 开关开机自启
 ## 配置
 
 设置保存在 `~/Library/Application Support/lidup/config.json`（可用 `LIDUP_CONFIG` 环境变量改路径）。
+
+## 开发
+
+### 构建并运行
+
+需要安装 Xcode 命令行工具和 Rust 工具链。
+
+```sh
+./pack.sh                       # 打包成菜单栏应用（无 Dock 图标）
+open target/release/lidup.app   # 运行
+```
+
+也可以直接跑命令行二进制（会显示 Dock 图标）：
+
+```sh
+cargo run --release
+```
