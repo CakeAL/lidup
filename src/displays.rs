@@ -306,15 +306,14 @@ pub fn recover_builtin() {
         return;
     };
 
-    // Retry: a config change can be rejected mid-transition, but a short while later
-    // it sticks. Try session config a few times, then fall back to a permanent config
-    // (which is more reliably accepted when the hardware set just changed).
+    // We do NOT use `is_on` to decide whether to retry: right after a physical unplug
+    // CGDisplayIsActive can report the built-in as active while its panel is dark, so
+    // that check is unreliable. Just always issue a forced config a few times (session
+    // first), then fall back to a permanent config, which is more reliably accepted
+    // when the hardware set just changed.
     for _ in 0..4 {
         let _ = configure_enabled_with(bid, true, false);
-        if is_on(bid) {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(300));
+        std::thread::sleep(std::time::Duration::from_millis(250));
     }
     let _ = configure_enabled_with(bid, true, true);
 }

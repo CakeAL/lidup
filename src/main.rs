@@ -96,29 +96,38 @@ fn snapshot(settings: &Settings) -> Box<Snapshot> {
 
 /// Re-evaluate the current display situation and publish a fresh snapshot.
 ///
-/// Re-evaluate the current display situation and publish a fresh snapshot.
-///
 /// Recovery is **not** driven by a CoreGraphics callback (which doesn't always fire
 /// on a physical cable pull). Instead it's a hard safety check: if *nothing* is lit,
 /// force the built-in back on via [`displays::recover_builtin`] (which issues a forced
 /// config call and retries). This only fires when there is genuinely no lit display,
 /// so it never fights a manual toggle that still leaves an external on
 /// (`active_count >= 1` in that case) — no flicker.
-fn refresh(proxy: &winit::event_loop::EventLoopProxy<UserEvent>, settings: &mut Settings) {
+fn refresh(
+    proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    settings: &mut Settings,
+    last_external: &mut Option<bool>,
+) {
     let before_id = settings.builtin_id;
     let before_key = settings.builtin_key.clone();
 
     auto::apply_auto(settings);
 
-    // BetterDisplay-style recovery: if there is *no external display online* and the
-    // built-in is not currently lit, force it back on. This is more reliable than a
-    // bare "nothing is lit" check (which can be fooled by a stale "active" report on
-    // the built-in right after an unplug). An external being present means we never
-    // fight a manual toggle-off of the built-in.
-    let displays_now = displays::online_displays();
-    let external_online = displays_now.iter().any(|d| !d.builtin);
-    let builtin_lit = displays_now.iter().any(|d| d.builtin && d.on);
-    if !external_online && !builtin_lit {
+    let displays_now: Vec<DisplayInfo> = displays::online_displays();
+    let has_external = displays_now.iter().any(|d| !d.builtin);
+    // "Online" is reliable for the built-in: when it is disabled it drops out of the
+    // online list. (Do NOT trust the `on` flag right after an unplug — the panel can
+    // be dark while CGDisplayIsActive reports it as active.)
+    let builtin_online = displays_now.iter().any(|d| d.builtin);
+
+    // A physical unplug is a reliable transition: there was an external before, none
+    // now. Recover on it (fires once, never spams the config calls).
+    let unplugged = matches!(last_external, Some(true)) && !has_external;
+    *last_external = Some(has_external);
+
+    // Recover the built-in when it is genuinely offline/disabled and there is no
+    // external that replaces it, OR right after an unplug (covers the built-in being
+    // reported online-but-dark just after the cable is pulled).
+    if (!has_external && !builtin_online) || unplugged {
         displays::recover_builtin();
     }
 
@@ -138,10 +147,14 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
         let _ = settings.save();
     }
 
+    // Track whether an external was present last refresh, so we can detect the
+    // unplug transition reliably (fires recovery once, never spams config calls).
+    let mut last_external: Option<bool> = None;
+
     // Event-driven from display changes / user actions, PLUS a low-frequency
-    // watchdog (every 2s) that re-checks the "is anything lit?" safety. Physical
-    // cable unplugs don't always fire a CoreGraphics callback, so the watchdog is
-    // what guarantees the built-in recovers even without a reliable event.
+    // watchdog (every 2s) that re-checks whether there's an external and the
+    // built-in is online. Physical cable unplugs don't always fire a CoreGraphics
+    // callback, so the watchdog is what guarantees the built-in recovers.
     loop {
         match rx.recv_timeout(Duration::from_millis(2000)) {
             Ok(ev) => match ev {
@@ -182,14 +195,14 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                 }
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Watchdog: re-check the "is anything lit?" safety. Mostly a no-op.
-                refresh(&proxy, &mut settings);
+                // Watchdog: re-check the unplug transition / built-in recovery.
+                refresh(&proxy, &mut settings, &mut last_external);
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
-        refresh(&proxy, &mut settings);
+        refresh(&proxy, &mut settings, &mut last_external);
     }
 }
 
