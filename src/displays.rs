@@ -291,11 +291,16 @@ pub fn ensure_one_on() {
 }
 
 /// Force the built-in display back on, even if it is currently powered off (and
-/// thus absent from the online list). Scans the low display ids, issues a *forced*
-/// configuration call (ignoring a possibly-stale "active" report), and retries a few
-/// times — because a call right at an unplug transition can be rejected.
+/// Force the built-in display back on (truly enabled), even if it is currently
+/// powered off (and thus absent from the online list). Scans the low display ids.
+///
+/// This mirrors the Dusk/BetterDisplay "recover" logic: recovering is not a one-shot
+/// call. A physical unplug leaves macOS mid-reconfiguration, so the first enable
+/// attempt can be silently rolled back. Instead we open a short **confirmation
+/// window** and re-assert the enable repeatedly (with a permanent config, which the
+/// system is more likely to accept after the hardware set changed) until the built-in
+/// is confirmed back online, or the window ends.
 pub fn recover_builtin() {
-    // Find the built-in id: from the online list if it's there, else scan.
     let bid = online_displays()
         .iter()
         .find(|d| d.builtin)
@@ -306,14 +311,16 @@ pub fn recover_builtin() {
         return;
     };
 
-    // We do NOT use `is_on` to decide whether to retry: right after a physical unplug
-    // CGDisplayIsActive can report the built-in as active while its panel is dark, so
-    // that check is unreliable. Just always issue a forced config a few times (session
-    // first), then fall back to a permanent config, which is more reliably accepted
-    // when the hardware set just changed.
-    for _ in 0..4 {
-        let _ = configure_enabled_with(bid, true, false);
-        std::thread::sleep(std::time::Duration::from_millis(250));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        let _ = configure_enabled_with(bid, true, true);
+        // Confirmed online? (A truly-enabled built-in rejoins the online list.)
+        if online_displays().iter().any(|d| d.builtin && d.on) {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(300));
     }
-    let _ = configure_enabled_with(bid, true, true);
 }

@@ -55,7 +55,9 @@ pub fn apply_auto(settings: &mut Settings) {
             let _ = displays::set_enabled(bid, false);
         }
     } else if settings.restore_builtin && !builtin_on {
-        let _ = displays::set_enabled(bid, true);
+        // Restore via the windowed recovery (re-asserts until confirmed online),
+        // rather than a one-shot enable that the unplug reconfig can roll back.
+        displays::recover_builtin();
     }
 }
 
