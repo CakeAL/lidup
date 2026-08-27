@@ -29,10 +29,13 @@ It answers the use case from
   > working symbol lives in the private `SkyLight` framework (verified on macOS 26/27
   > Apple Silicon here).
 
-- **Event-driven (no polling)** — lidup registers a `CGDisplayRegisterReconfiguration`
-  callback and only reacts when the display configuration actually changes (a monitor
-  is plugged in / unplugged / powered) or when you touch the menu. There is no
-  timer-based loop burning CPU every few hundred milliseconds.
+- **Event-driven + light safety watchdog** — lidup registers a
+  `CGDisplayRegisterReconfiguration` callback and reacts when the display
+  configuration changes (a monitor is plugged in / unplugged / powered) or when you
+  touch the menu. Because a physical cable unplug does **not** always raise that
+  callback on every Mac/adaptor, a lightweight watchdog re-checks every ~2s; it is
+  almost always a no-op and only acts when a display actually needs to change. This
+  guarantees the built-in display is never left stuck off.
 
 - **Config persistence** — JSON in `~/Library/Application Support/lidup/config.json`:
   the bound external display key (`vendor:model:serial`), whether to restore the
@@ -64,6 +67,8 @@ When running, the menu bar icon (`lidup`) shows:
 - **Start at Login** — a checkable item that registers lidup as a login item via
   Apple's `SMAppService` framework, so it launches automatically at login. Tick it to
   register, untick to remove.
+- **Restore Built-in Display** — a menu item that immediately turns the built-in back
+  on (manual recovery if it ever gets stuck off).
 - **Quit** — restores the built-in display, then exits.
 
 To select which external display to bind, open the menu → **Auto-off built-in when

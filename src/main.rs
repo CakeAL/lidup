@@ -11,6 +11,7 @@ use lidup::{auto, config, displays, launch};
 use config::Settings;
 use displays::DisplayInfo;
 use std::sync::mpsc;
+use std::time::Duration;
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
@@ -39,6 +40,8 @@ enum WorkerEvent {
     SetBound(Option<String>),
     /// Enable (`true`) / disable (`false`) launch-at-login. `None` = no change.
     SetLaunchAtLogin(Option<bool>),
+    /// Immediately force the built-in display back on (manual recovery).
+    RestoreBuiltin,
     Quit,
 }
 
@@ -116,9 +119,13 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
         let _ = settings.save();
     }
 
-    // Block until the next event (display change or user action). No polling.
+    // Event-driven from display changes / user actions. In addition there is a low
+    // frequency SAFETY watchdog (every 2s) that only acts when *every* display is
+    // dark — a physical cable unplug does not always raise a CoreGraphics
+    // reconfiguration callback on all hardware, so this guarantees the built-in
+    // never gets stuck off.
     loop {
-        match rx.recv() {
+        match rx.recv_timeout(Duration::from_millis(2000)) {
             Ok(ev) => match ev {
                 WorkerEvent::DisplayChanged => {
                     // A display was inserted/removed/powered; re-evaluate the rule.
@@ -135,6 +142,9 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                 WorkerEvent::SetBound(key) => {
                     settings.bound_key = key;
                     let _ = settings.save();
+                }
+                WorkerEvent::RestoreBuiltin => {
+                    displays::recover_builtin();
                 }
                 WorkerEvent::SetLaunchAtLogin(enabled) => {
                     if let Some(enabled) = enabled {
@@ -156,11 +166,19 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                     return;
                 }
             },
-            Err(_) => return, // channel closed (main thread ended)
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // Safety watchdog: physical cable unplugs don't always raise a
+                // CoreGraphics callback, so run the (idempotent) auto rule + the
+                // "never leave every display dark" recovery every couple of seconds.
+                // Most iterations are a no-op; it only acts when something changed.
+                refresh(&proxy, &mut settings);
+                continue;
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
-        // After any event: apply the auto rule + keep at least one display lit,
-        // then push the fresh state to the UI.
+        // After any real event: apply the auto rule + keep at least one display
+        // lit, then push the fresh state to the UI.
         refresh(&proxy, &mut settings);
     }
 }
@@ -244,6 +262,10 @@ impl MenuState {
             let _ = menu.append(&item);
             toggle_items.push((d.id, item));
         }
+
+        // Manual recovery, in case the built-in ever gets stuck off.
+        let restore = MenuItem::with_id("restore-builtin", "Restore Built-in Display", true, None);
+        let _ = menu.append(&restore);
 
         let _ = menu.append(&PredefinedMenuItem::separator());
         if !snap.control_ok {
@@ -344,6 +366,8 @@ impl ApplicationHandler<UserEvent> for App {
                 let id = ev.id();
                 if id == "quit" {
                     let _ = self.cmd_tx.send(WorkerEvent::Quit);
+                } else if id == "restore-builtin" {
+                    let _ = self.cmd_tx.send(WorkerEvent::RestoreBuiltin);
                 } else if id == "start-login" {
                     // Toggle based on the state shown in the menu (cached), so the
                     // action matches the checkmark. No SMAppService query per click.
