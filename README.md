@@ -29,13 +29,14 @@ It answers the use case from
   > working symbol lives in the private `SkyLight` framework (verified on macOS 26/27
   > Apple Silicon here).
 
-- **Event-driven + light safety watchdog** — lidup registers a
-  `CGDisplayRegisterReconfiguration` callback and reacts when the display
-  configuration changes (a monitor is plugged in / unplugged / powered) or when you
-  touch the menu. Because a physical cable unplug does **not** always raise that
-  callback on every Mac/adaptor, a lightweight watchdog re-checks every ~2s; it is
-  almost always a no-op and only acts when a display actually needs to change. This
-  guarantees the built-in display is never left stuck off.
+- **Recovery drives off the external count, not a callback** — lidup watches the
+  **number of external displays**. When that number decreases (an external was
+  unplugged) and nothing is left lit, it re-powers the built-in. This is the same
+  approach BetterDisplay uses and does **not** depend on a CoreGraphics
+  reconfiguration callback, which doesn't always fire on a physical cable pull. A
+  low-frequency watchdog re-checks the count every ~2s, so it recovers even
+  mid-transition and never leaves the built-in stuck off. Because a manual toggle
+  does **not** change the external count, it is never fought by this — no flicker.
 
 - **Config persistence** — JSON in `~/Library/Application Support/lidup/config.json`:
   the bound external display key (`vendor:model:serial`), whether to restore the
@@ -43,12 +44,13 @@ It answers the use case from
 
 ### Behaviour rules
 
-- **External unplugged** → the built-in display is restored (if auto is set).
+- **External unplugged** → the built-in display is restored (auto or not).
 - **Bound external plugged in** → the built-in display is turned off.
 - **Manual toggle of any display** → the auto-off rule is set to `None` so it never
-  fights your manual change.
-- **Safety:** lidup never leaves you with a dark screen — it refuses to turn off the
-  last lit display, and re-powers one if everything somehow ends up off.
+  fights your manual change (and the removal-detection never re-powers a display you
+  turned off yourself, since it only reacts to the external count changing).
+- **Safety:** lidup re-powers the built-in if you unplug the last external and
+  nothing is lit — no dark screen.
 - **If the app is terminated** (e.g. the OS kills the login item when it is unticked
   in System Settings), lidup restores the built-in display before exiting.
 
@@ -67,8 +69,6 @@ When running, the menu bar icon (`lidup`) shows:
 - **Start at Login** — a checkable item that registers lidup as a login item via
   Apple's `SMAppService` framework, so it launches automatically at login. Tick it to
   register, untick to remove.
-- **Restore Built-in Display** — a menu item that immediately turns the built-in back
-  on (manual recovery if it ever gets stuck off).
 - **Quit** — restores the built-in display, then exits.
 
 To select which external display to bind, open the menu → **Auto-off built-in when

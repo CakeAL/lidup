@@ -40,8 +40,6 @@ enum WorkerEvent {
     SetBound(Option<String>),
     /// Enable (`true`) / disable (`false`) launch-at-login. `None` = no change.
     SetLaunchAtLogin(Option<bool>),
-    /// Immediately force the built-in display back on (manual recovery).
-    RestoreBuiltin,
     Quit,
 }
 
@@ -96,13 +94,45 @@ fn snapshot(settings: &Settings) -> Box<Snapshot> {
     })
 }
 
-/// Re-apply the auto-off rule and the "at least one display lit" safety, then
-/// publish a fresh snapshot. Safe to call after any display change or command.
-fn refresh(proxy: &winit::event_loop::EventLoopProxy<UserEvent>, settings: &mut Settings) {
+/// Re-evaluate the current display situation and publish a fresh snapshot.
+///
+/// Recovery of the built-in display is driven by detecting that the **number of
+/// external displays decreased** (an external was unplugged) while nothing is lit —
+/// NOT by trusting a system callback, which doesn't always fire on a physical cable
+/// pull. This is the same idea BetterDisplay uses. Because a low-frequency watchdog
+/// re-checks the count, it recovers even mid-transition and never leaves the built-in
+/// stuck off. Crucially, a **manual toggle doesn't change the external count**, so it
+/// is never fought by this — no flicker when you turn the built-in off yourself.
+fn refresh(
+    proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    settings: &mut Settings,
+    last_external: &mut Option<usize>,
+) {
     let before_id = settings.builtin_id;
     let before_key = settings.builtin_key.clone();
+
+    // How many external displays are plugged in right now?
+    let current_external = displays::online_displays()
+        .iter()
+        .filter(|d| !d.builtin)
+        .count();
+
+    // Was an external unplugged since the last check? On the first check we don't
+    // know (None), so only recover on a real 1 -> 0 (or higher -> lower) transition.
+    let external_removed = matches!(last_external, Some(prev) if *prev > current_external);
+    if let Some(existing) = last_external.as_mut() {
+        *existing = current_external;
+    } else {
+        *last_external = Some(current_external);
+    }
+
     auto::apply_auto(settings);
-    displays::ensure_one_on();
+
+    // Safety: an external was unplugged and everything went dark — wake the built-in.
+    if external_removed && displays::active_count() == 0 {
+        displays::recover_builtin();
+    }
+
     if settings.builtin_id != before_id || settings.builtin_key != before_key {
         let _ = settings.save();
     }
@@ -119,16 +149,19 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
         let _ = settings.save();
     }
 
-    // Event-driven from display changes / user actions. In addition there is a low
-    // frequency SAFETY watchdog (every 2s) that only acts when *every* display is
-    // dark — a physical cable unplug does not always raise a CoreGraphics
-    // reconfiguration callback on all hardware, so this guarantees the built-in
-    // never gets stuck off.
+    // Track how many external displays are plugged in, so we can detect a removal
+    // even without a reliable system callback. `None` = first evaluation, no baseline.
+    let mut last_external: Option<usize> = None;
+
+    // Event-driven from display changes / user actions, PLUS a low-frequency
+    // watchdog (every 2s) that re-checks the external count. Physical cable unplugs
+    // don't always fire a CoreGraphics callback, so the watchdog is what guarantees
+    // the external-removal is noticed and the built-in recovers.
     loop {
         match rx.recv_timeout(Duration::from_millis(2000)) {
             Ok(ev) => match ev {
                 WorkerEvent::DisplayChanged => {
-                    // A display was inserted/removed/powered; re-evaluate the rule.
+                    // A display was inserted/removed/powered; re-evaluate.
                 }
                 WorkerEvent::Toggle(id) => {
                     // A manual toggle is an explicit user override: disable the
@@ -142,9 +175,6 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                 WorkerEvent::SetBound(key) => {
                     settings.bound_key = key;
                     let _ = settings.save();
-                }
-                WorkerEvent::RestoreBuiltin => {
-                    displays::recover_builtin();
                 }
                 WorkerEvent::SetLaunchAtLogin(enabled) => {
                     if let Some(enabled) = enabled {
@@ -167,19 +197,15 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                 }
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                // Safety watchdog: physical cable unplugs don't always raise a
-                // CoreGraphics callback, so run the (idempotent) auto rule + the
-                // "never leave every display dark" recovery every couple of seconds.
-                // Most iterations are a no-op; it only acts when something changed.
-                refresh(&proxy, &mut settings);
+                // Watchdog: re-check the external count and recover the built-in if
+                // an external was unplugged and nothing is lit. Mostly a no-op.
+                refresh(&proxy, &mut settings, &mut last_external);
                 continue;
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
-        // After any real event: apply the auto rule + keep at least one display
-        // lit, then push the fresh state to the UI.
-        refresh(&proxy, &mut settings);
+        refresh(&proxy, &mut settings, &mut last_external);
     }
 }
 
@@ -262,10 +288,6 @@ impl MenuState {
             let _ = menu.append(&item);
             toggle_items.push((d.id, item));
         }
-
-        // Manual recovery, in case the built-in ever gets stuck off.
-        let restore = MenuItem::with_id("restore-builtin", "Restore Built-in Display", true, None);
-        let _ = menu.append(&restore);
 
         let _ = menu.append(&PredefinedMenuItem::separator());
         if !snap.control_ok {
@@ -366,8 +388,6 @@ impl ApplicationHandler<UserEvent> for App {
                 let id = ev.id();
                 if id == "quit" {
                     let _ = self.cmd_tx.send(WorkerEvent::Quit);
-                } else if id == "restore-builtin" {
-                    let _ = self.cmd_tx.send(WorkerEvent::RestoreBuiltin);
                 } else if id == "start-login" {
                     // Toggle based on the state shown in the menu (cached), so the
                     // action matches the checkmark. No SMAppService query per click.
