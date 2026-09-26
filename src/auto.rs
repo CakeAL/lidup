@@ -74,7 +74,7 @@ pub fn apply_auto_with_list(settings: &mut Settings, list: &[displays::DisplayIn
     } else if settings.restore_builtin && !builtin_on {
         // Restore via the windowed recovery (re-asserts until confirmed online),
         // rather than a one-shot enable that the unplug reconfig can roll back.
-        displays::recover_builtin();
+        displays::recover_builtin_with_id(settings.builtin_id);
     }
 }
 

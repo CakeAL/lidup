@@ -165,11 +165,6 @@ pub fn is_on(id: DisplayID) -> bool {
     unsafe { CGDisplayIsActive(id) != 0 }
 }
 
-/// A cached built-in id can still report sleep after it leaves the online list.
-pub fn is_asleep(id: DisplayID) -> bool {
-    unsafe { CGDisplayIsAsleep(id) != 0 }
-}
-
 /// True if `id` is the built-in display, even if it is currently powered off.
 /// (A powered-off built-in drops out of the online list, but its id remains valid.)
 pub fn builtin_probe(id: DisplayID) -> bool {
@@ -319,10 +314,17 @@ pub fn ensure_one_on() {
 /// system is more likely to accept after the hardware set changed) until the built-in
 /// is confirmed back online, or the window ends.
 pub fn recover_builtin() {
+    recover_builtin_with_id(None);
+}
+
+/// Like [`recover_builtin`], but try the persisted built-in id before scanning.
+/// Display ids are not necessarily in the small range used by the fallback.
+pub fn recover_builtin_with_id(cached_id: Option<DisplayID>) {
     let bid = online_displays()
         .iter()
         .find(|d| d.builtin)
         .map(|d| d.id)
+        .or_else(|| cached_id.filter(|&id| builtin_probe(id)))
         .or_else(|| (1..=16u32).find(|&id| builtin_probe(id)));
 
     let Some(bid) = bid else {

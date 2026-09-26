@@ -94,6 +94,16 @@ fn snapshot(settings: &Settings) -> Box<Snapshot> {
     })
 }
 
+fn needs_builtin_restore(
+    builtin_on: bool,
+    another_external_on: bool,
+    restore_builtin: bool,
+    bound_was_present: bool,
+) -> bool {
+    (!builtin_on && (restore_builtin || !another_external_on))
+        || (bound_was_present && !another_external_on)
+}
+
 /// Re-evaluate the current display situation and publish a fresh snapshot.
 ///
 /// A bound monitor must remain absent for five seconds before the built-in is
@@ -103,6 +113,7 @@ fn refresh(
     proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     settings: &mut Settings,
     missing_since: &mut Option<Instant>,
+    bound_was_present: &mut bool,
 ) -> Option<Instant> {
     // auto = None means the user wants full manual control: do NOT touch the built-in
     // at all (no auto-off, no auto-restore). Otherwise the app would fight the user —
@@ -110,6 +121,7 @@ fn refresh(
     // mode do we manage the built-in.
     if settings.bound_key.is_none() {
         *missing_since = None;
+        *bound_was_present = false;
         let _ = proxy.send_event(UserEvent::Snapshot(snapshot(settings)));
         return None;
     }
@@ -128,26 +140,39 @@ fn refresh(
     let mut retry_at = None;
     if bound_present {
         *missing_since = None;
+        *bound_was_present = true;
         // Do not run the auto rule against a transiently missing external during
         // wake: its restore path performs a permanent display configuration.
         auto::apply_auto_with_list(settings, &displays_now);
     } else {
-        let builtin_asleep = displays_now.iter().any(|d| d.builtin && d.asleep)
-            || settings
-                .builtin_id
-                .is_some_and(|id| displays::builtin_probe(id) && displays::is_asleep(id));
+        // Only an online built-in has a trustworthy sleep state. A display
+        // disabled by this app is absent from the online list and querying its
+        // cached id can report "asleep" even after a real cable unplug.
+        let builtin_asleep = displays_now.iter().any(|d| d.builtin && d.asleep);
         let builtin_on = displays_now.iter().any(|d| d.builtin && d.on);
         let another_external_on = displays_now.iter().any(|d| !d.builtin && d.on);
-        if builtin_asleep || builtin_on || (!settings.restore_builtin && another_external_on) {
+        // CoreGraphics can report the built-in as active while its panel is
+        // still dark after unplug. Keep the old transition-based forced restore.
+        let needs_restore = needs_builtin_restore(
+            builtin_on,
+            another_external_on,
+            settings.restore_builtin,
+            *bound_was_present,
+        );
+        if builtin_asleep || !needs_restore {
             *missing_since = None;
+            if builtin_on {
+                *bound_was_present = false;
+            }
         } else {
             // A monitor can briefly disappear from CGGetOnlineDisplayList during
             // wake. Only restore the built-in if the bound monitor stays absent.
             let since = *missing_since.get_or_insert_with(Instant::now);
             let deadline = since + Duration::from_secs(5);
             if Instant::now() >= deadline {
-                displays::recover_builtin();
+                displays::recover_builtin_with_id(settings.builtin_id);
                 *missing_since = None;
+                *bound_was_present = false;
             } else {
                 retry_at = Some(deadline);
             }
@@ -158,7 +183,30 @@ fn refresh(
         let _ = settings.save();
     }
     let _ = proxy.send_event(UserEvent::Snapshot(snapshot(settings)));
-    retry_at
+    // A cable pull does not always emit a CoreGraphics callback. Check again
+    // while auto mode is active so an unplug cannot leave the built-in dark.
+    let watchdog = Instant::now() + Duration::from_secs(2);
+    Some(retry_at.map_or(watchdog, |at| at.min(watchdog)))
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::needs_builtin_restore;
+
+    #[test]
+    fn unplug_restores_even_if_coregraphics_still_reports_builtin_active() {
+        assert!(needs_builtin_restore(true, false, true, true));
+    }
+
+    #[test]
+    fn missing_bound_monitor_restores_disabled_builtin() {
+        assert!(needs_builtin_restore(false, false, true, false));
+    }
+
+    #[test]
+    fn another_external_keeps_manual_restore_setting() {
+        assert!(!needs_builtin_restore(false, true, false, true));
+    }
 }
 
 fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receiver<WorkerEvent>) {
@@ -172,6 +220,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
     }
 
     let mut missing_since = None;
+    let mut bound_was_present = false;
     let mut pending_refresh: Option<Instant> = None;
 
     // Coalesce the per-display callbacks into one settled snapshot. A single
@@ -209,7 +258,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                     // it would stay off (a fully-disabled built-in doesn't even
                     // recover on lid open, since it's software-disabled, not asleep).
                     if going_to_manual {
-                        displays::recover_builtin();
+                        displays::recover_builtin_with_id(settings.builtin_id);
                     }
                 }
                 WorkerEvent::SetLaunchAtLogin(enabled) => {
@@ -227,7 +276,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                 }
                 WorkerEvent::Quit => {
                     // Restore the built-in display so the user isn't left dark.
-                    displays::recover_builtin();
+                    displays::recover_builtin_with_id(settings.builtin_id);
                     let _ = proxy.send_event(UserEvent::Exit);
                     return;
                 }
@@ -236,7 +285,12 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
-        pending_refresh = refresh(&proxy, &mut settings, &mut missing_since);
+        pending_refresh = refresh(
+            &proxy,
+            &mut settings,
+            &mut missing_since,
+            &mut bound_was_present,
+        );
     }
 }
 
