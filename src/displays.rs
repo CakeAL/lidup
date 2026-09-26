@@ -165,6 +165,11 @@ pub fn is_on(id: DisplayID) -> bool {
     unsafe { CGDisplayIsActive(id) != 0 }
 }
 
+/// A cached built-in id can still report sleep after it leaves the online list.
+pub fn is_asleep(id: DisplayID) -> bool {
+    unsafe { CGDisplayIsAsleep(id) != 0 }
+}
+
 /// True if `id` is the built-in display, even if it is currently powered off.
 /// (A powered-off built-in drops out of the online list, but its id remains valid.)
 pub fn builtin_probe(id: DisplayID) -> bool {
@@ -235,7 +240,14 @@ pub fn set_builtin(on: bool) -> Result<(), String> {
 /// its own internal thread, not the thread that registered the callback.
 static RECONFIG: OnceLock<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = OnceLock::new();
 
-extern "C" fn reconfig_trampoline(_display: u32, _flags: u32, _user: *mut c_void) {
+// CoreGraphics calls the handler once *before* a configuration transaction and
+// again after it. The online list is only authoritative in the latter callback.
+const K_CG_DISPLAY_BEGIN_CONFIGURATION_FLAG: u32 = 1 << 0;
+
+extern "C" fn reconfig_trampoline(_display: u32, flags: u32, _user: *mut c_void) {
+    if flags & K_CG_DISPLAY_BEGIN_CONFIGURATION_FLAG != 0 {
+        return;
+    }
     // CoreGraphics callbacks run on a non-main thread; forward to the handler.
     if let Some(lock) = RECONFIG.get() {
         if let Some(h) = lock.lock().unwrap().as_ref() {

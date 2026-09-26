@@ -15,6 +15,13 @@ pub fn decide(settings: &Settings, list: &[displays::DisplayInfo]) -> Option<(u3
     let present = bound_present(list, bound);
     let builtin = list.iter().find(|d| d.builtin)?;
 
+    // Sleep is not a request to change the display configuration. In particular,
+    // disabling a still-active but sleeping panel can reconfigure the external
+    // display during wake and discard its HDR mode.
+    if builtin.asleep {
+        return None;
+    }
+
     if present {
         // The bound external is connected: keep the built-in off.
         if builtin.on {
@@ -36,9 +43,19 @@ pub fn decide(settings: &Settings, list: &[displays::DisplayInfo]) -> Option<(u3
 /// `settings` (refreshed whenever it is seen online) to allow restoring it.
 pub fn apply_auto(settings: &mut Settings) {
     let list = displays::online_displays();
+    apply_auto_with_list(settings, &list);
+}
+
+/// Apply the rule to a single settled snapshot. The worker must use the same
+/// snapshot it checked for a bound external; re-enumerating could catch a
+/// different, transient state halfway through wake.
+pub fn apply_auto_with_list(settings: &mut Settings, list: &[displays::DisplayInfo]) {
     if let Some(b) = list.iter().find(|d| d.builtin) {
         settings.builtin_id = Some(b.id);
         settings.builtin_key = Some(b.key.clone());
+        if b.asleep {
+            return;
+        }
     }
     let Some(bid) = settings.builtin_id else {
         return;
@@ -147,5 +164,18 @@ mod tests {
         let s = settings(Some("ext:1"), true);
         let list = vec![disp(2, false, true, "ext:1")];
         assert_eq!(decide(&s, &list), None);
+    }
+
+    #[test]
+    fn sleeping_builtin_is_never_reconfigured() {
+        let s = settings(Some("ext:1"), true);
+        let mut builtin = disp(1, true, true, "builtin");
+        builtin.asleep = true;
+        assert_eq!(
+            decide(&s, &[builtin.clone(), disp(2, false, true, "ext:1")]),
+            None
+        );
+        builtin.on = false;
+        assert_eq!(decide(&s, &[builtin]), None);
     }
 }

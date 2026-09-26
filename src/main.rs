@@ -11,6 +11,7 @@ use lidup::{auto, config, displays, launch};
 use config::Settings;
 use displays::DisplayInfo;
 use std::sync::mpsc;
+use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
 use winit::window::WindowId;
@@ -27,9 +28,8 @@ struct Snapshot {
     launch_at_login: bool,
 }
 
-/// Events that wake the worker thread. The worker is **event-driven**: it blocks
-/// until either the display configuration changes (a display is plugged in or
-/// unplugged) or the user performs a menu action. There is no periodic polling.
+/// Events that wake the worker thread. Display callbacks are coalesced before
+/// evaluation; a missing bound monitor gets one delayed confirmation.
 enum WorkerEvent {
     /// A display was inserted, removed, re-arranged or powered on/off.
     DisplayChanged,
@@ -96,50 +96,69 @@ fn snapshot(settings: &Settings) -> Box<Snapshot> {
 
 /// Re-evaluate the current display situation and publish a fresh snapshot.
 ///
-/// Recovery is **not** driven by a CoreGraphics callback (which doesn't always fire
-/// on a physical cable pull). Instead it's a hard safety check: if *nothing* is lit,
-/// force the built-in back on via [`displays::recover_builtin`] (which issues a forced
-/// config call and retries). This only fires when there is genuinely no lit display,
-/// so it never fights a manual toggle that still leaves an external on
-/// (`active_count >= 1` in that case) — no flicker.
+/// A bound monitor must remain absent for five seconds before the built-in is
+/// restored. Wake can temporarily remove it from the online list; restoring it
+/// during that interval changes the external monitor's display configuration.
 fn refresh(
     proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     settings: &mut Settings,
-    last_external: &mut Option<bool>,
-) {
+    missing_since: &mut Option<Instant>,
+) -> Option<Instant> {
     // auto = None means the user wants full manual control: do NOT touch the built-in
     // at all (no auto-off, no auto-restore). Otherwise the app would fight the user —
     // e.g. re-light the built-in after they closed the lid. Only in auto (bound)
     // mode do we manage the built-in.
     if settings.bound_key.is_none() {
+        *missing_since = None;
         let _ = proxy.send_event(UserEvent::Snapshot(snapshot(settings)));
-        return;
+        return None;
     }
 
     let before_id = settings.builtin_id;
     let before_key = settings.builtin_key.clone();
 
-    auto::apply_auto(settings);
-
     let displays_now: Vec<DisplayInfo> = displays::online_displays();
-    let has_external = displays_now.iter().any(|d| !d.builtin);
-    let builtin_online = displays_now.iter().any(|d| d.builtin);
-    // A sleeping built-in means the lid is closed (or the Mac is asleep). Never touch
-    // it then — otherwise we'd flip the screen back on after the user closed the lid.
-    let builtin_asleep = displays_now.iter().any(|d| d.builtin && d.asleep);
-    let unplugged = matches!(last_external, Some(true)) && !has_external;
-    *last_external = Some(has_external);
-
-    // Recover the built-in when it is genuinely offline/disabled and there is no
-    // external that replaces it, OR right after an unplug — but never if asleep.
-    if !builtin_asleep && ((!has_external && !builtin_online) || unplugged) {
-        displays::recover_builtin();
+    if let Some(b) = displays_now.iter().find(|d| d.builtin) {
+        settings.builtin_id = Some(b.id);
+        settings.builtin_key = Some(b.key.clone());
+    }
+    let bound_present = displays_now
+        .iter()
+        .any(|d| !d.builtin && Some(d.key.as_str()) == settings.bound_key.as_deref());
+    let mut retry_at = None;
+    if bound_present {
+        *missing_since = None;
+        // Do not run the auto rule against a transiently missing external during
+        // wake: its restore path performs a permanent display configuration.
+        auto::apply_auto_with_list(settings, &displays_now);
+    } else {
+        let builtin_asleep = displays_now.iter().any(|d| d.builtin && d.asleep)
+            || settings
+                .builtin_id
+                .is_some_and(|id| displays::builtin_probe(id) && displays::is_asleep(id));
+        let builtin_on = displays_now.iter().any(|d| d.builtin && d.on);
+        let another_external_on = displays_now.iter().any(|d| !d.builtin && d.on);
+        if builtin_asleep || builtin_on || (!settings.restore_builtin && another_external_on) {
+            *missing_since = None;
+        } else {
+            // A monitor can briefly disappear from CGGetOnlineDisplayList during
+            // wake. Only restore the built-in if the bound monitor stays absent.
+            let since = *missing_since.get_or_insert_with(Instant::now);
+            let deadline = since + Duration::from_secs(5);
+            if Instant::now() >= deadline {
+                displays::recover_builtin();
+                *missing_since = None;
+            } else {
+                retry_at = Some(deadline);
+            }
+        }
     }
 
     if settings.builtin_id != before_id || settings.builtin_key != before_key {
         let _ = settings.save();
     }
     let _ = proxy.send_event(UserEvent::Snapshot(snapshot(settings)));
+    retry_at
 }
 
 fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receiver<WorkerEvent>) {
@@ -152,18 +171,25 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
         let _ = settings.save();
     }
 
-    // Track whether an external was present last refresh, so we can detect the
-    // unplug transition (fires recovery once, never spams config calls).
-    let mut last_external: Option<bool> = None;
+    let mut missing_since = None;
+    let mut pending_refresh: Option<Instant> = None;
 
-    // Purely EVENT-DRIVEN: we block on `rx.recv()` and only wake when the system
-    // notifies us (via the CGDisplayRegisterReconfiguration callback, which posts
-    // WorkerEvent::DisplayChanged) or the user touches the menu. No polling loop.
+    // Coalesce the per-display callbacks into one settled snapshot. A single
+    // reconfiguration sends multiple callbacks, particularly during sleep/wake.
     loop {
-        match rx.recv() {
+        let event = if let Some(deadline) = pending_refresh {
+            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+        } else {
+            rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
+        };
+        match event {
             Ok(ev) => match ev {
                 WorkerEvent::DisplayChanged => {
-                    // The system notified us that the display set changed.
+                    // Start the absence confirmation after the latest completed
+                    // reconfiguration, including one delivered on system wake.
+                    missing_since = None;
+                    pending_refresh = Some(Instant::now() + Duration::from_millis(700));
+                    continue;
                 }
                 WorkerEvent::Toggle(id) => {
                     // A manual toggle is an explicit user override: disable the
@@ -206,10 +232,11 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                     return;
                 }
             },
-            Err(_) => return, // channel closed (main thread ended)
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
-        refresh(&proxy, &mut settings, &mut last_external);
+        pending_refresh = refresh(&proxy, &mut settings, &mut missing_since);
     }
 }
 
