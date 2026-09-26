@@ -20,15 +20,6 @@ https://github.com/CakeAL/lidup/releases
 - **Start at Login** — 开机自启（注册登录项）。
 - **Quit** — 退出，并恢复内建显示器。
 
-### 命令行辅助
-
-```sh
-lidup list                  # 查看当前显示器及开关状态
-lidup selftest              # 把内建屏关-开一次自检（结束后会恢复）
-lidup recover               # 强制把内建屏点亮
-lidup autostart on|off      # 开关开机自启
-```
-
 ---
 
 ## 说明
@@ -51,10 +42,4 @@ lidup autostart on|off      # 开关开机自启
 ```sh
 ./pack.sh                       # 打包成菜单栏应用（无 Dock 图标）
 open target/release/lidup.app   # 运行
-```
-
-也可以直接跑命令行二进制（会显示 Dock 图标）：
-
-```sh
-cargo run --release
 ```

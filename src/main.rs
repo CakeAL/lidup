@@ -592,98 +592,6 @@ fn tray_image() -> tray_icon::Icon {
 // Entry point
 // ---------------------------------------------------------------------------
 
-/// Look for a built-in display id in the online list, falling back to the cached
-/// id, then to scanning the low display ids (only used for `recover`).
-fn find_builtin_id(settings: &Settings) -> Option<u32> {
-    if let Some(b) = displays::builtin_display() {
-        return Some(b.id);
-    }
-    if let Some(id) = settings.builtin_id {
-        return Some(id);
-    }
-    // Fallback scan for the internal panel id.
-    for id in 1..=16u32 {
-        if displays::is_on(id) || displays::builtin_probe(id) {
-            return Some(id);
-        }
-    }
-    None
-}
-
-fn cli() -> bool {
-    let args: Vec<String> = std::env::args().collect();
-    let Some(cmd) = args.get(1) else {
-        return false; // no subcommand -> run the tray app
-    };
-    let settings = Settings::load();
-    match cmd.as_str() {
-        "list" => {
-            println!(
-                "display control available: {}",
-                displays::control_available()
-            );
-            println!("bound external key: {:?}", settings.bound_key);
-            println!("launch at login: {}", launch::check_reg_status());
-            for d in displays::online_displays() {
-                let role = if d.builtin { "built-in" } else { "external" };
-                println!(
-                    "  id={:>3} {role:<8} on={} vendor={:04x} model={:04x} {}x{} key={}",
-                    d.id, d.on, d.vendor, d.model, d.width, d.height, d.key
-                );
-            }
-            true
-        }
-        "autostart" => {
-            // `autostart` shows status; `autostart on|off` enables/disables.
-            match args.get(2).map(String::as_str) {
-                Some("on") => match launch::register() {
-                    Ok(()) => println!("launch-at-login enabled"),
-                    Err(e) => println!("failed to enable launch-at-login: {e}"),
-                },
-                Some("off") => match launch::unregister() {
-                    Ok(()) => println!("launch-at-login disabled"),
-                    Err(e) => println!("failed to disable launch-at-login: {e}"),
-                },
-                _ => println!("launch-at-login: {}", launch::check_reg_status()),
-            }
-            true
-        }
-        "recover" => {
-            // Bring the built-in back on, using the cached id when known.
-            if let Some(bid) = find_builtin_id(&settings) {
-                match displays::set_enabled(bid, true) {
-                    Ok(()) => println!("re-enabled built-in display {bid}"),
-                    Err(e) => println!("failed to re-enable {bid}: {e}"),
-                }
-                let _ = settings.save();
-            } else {
-                println!("could not find the built-in display");
-            }
-            true
-        }
-        "selftest" => {
-            // Safety: always restore the built-in before returning.
-            let id = displays::builtin_display()
-                .map(|d| d.id)
-                .or(settings.builtin_id);
-            if let Some(bid) = id {
-                println!("turning off built-in {bid}");
-                let _ = displays::set_enabled(bid, false);
-                std::thread::sleep(std::time::Duration::from_millis(700));
-                println!("  on={}", displays::is_on(bid));
-                println!("turning back on built-in {bid}");
-                let _ = displays::set_enabled(bid, true);
-                std::thread::sleep(std::time::Duration::from_millis(700));
-                println!("  on={}", displays::is_on(bid));
-            } else {
-                println!("no built-in display found");
-            }
-            true
-        }
-        _ => false,
-    }
-}
-
 /// If lidup is terminated (SIGTERM/SIGINT/SIGHUP — e.g. the OS kills the login
 /// item when it is unticked in System Settings, or the app is quit externally),
 /// restore the built-in display so the user is never left with a dark screen.
@@ -713,10 +621,6 @@ fn set_menu_bar_only() {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if cli() {
-        return Ok(());
-    }
-
     set_menu_bar_only();
 
     // Set up the tray/menu event handlers once, forwarding into the winit loop so
