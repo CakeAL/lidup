@@ -8,11 +8,12 @@ cargo build --release
 
 BIN="target/release/lidup"
 APP="target/release/lidup.app"
+APP_VERSION=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/lidup"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -20,8 +21,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
     <key>CFBundleName</key><string>lidup</string>
     <key>CFBundleDisplayName</key><string>lidup</string>
     <key>CFBundleIdentifier</key><string>com.lidup.app</string>
-    <key>CFBundleVersion</key><string>0.1.1</string>
-    <key>CFBundleShortVersionString</key><string>0.1.1</string>
+    <key>CFBundleVersion</key><string>$APP_VERSION</string>
+    <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleExecutable</key><string>lidup</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
@@ -31,9 +32,9 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Simple ad-hoc signature (personal use / no App Store / no Developer ID needed).
-# This is enough for the app to run locally and be launched at login.
-codesign --force --deep --sign - "$APP" >/dev/null 2>&1 || echo "!! ad-hoc codesign failed (optional)"
+# The updater verifies the extracted bundle before installing it.
+codesign --force --deep --sign - "$APP" >/dev/null
+codesign --verify --deep --strict "$APP"
 
 # Package as a .zip so it can be published as a release asset / shared directly.
 # `ditto -c -k --keepParent` preserves the .app bundle structure on unzip.

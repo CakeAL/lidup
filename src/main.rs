@@ -6,7 +6,7 @@
 //! auto-off rule and pushes a snapshot to the winit event loop, which renders the
 //! menu-bar menu. Menu item ids are turned into commands on the worker thread.
 
-use lidup::{auto, config, displays, launch};
+use lidup::{auto, config, displays, launch, updates};
 
 use config::Settings;
 use displays::DisplayInfo;
@@ -44,9 +44,87 @@ enum WorkerEvent {
 
 enum UserEvent {
     Snapshot(Box<Snapshot>),
+    UpdateChecking,
+    UpdateChecked(Result<Option<String>, String>),
+    UpdateInstalling(String),
+    UpdateInstalled(Result<String, String>),
     Menu(tray_icon::menu::MenuEvent),
     Tray,
     Exit,
+}
+
+#[derive(Clone)]
+enum UpdateStatus {
+    Checking,
+    Current,
+    Available(String),
+    Installing(String),
+    Installed(String),
+    CheckFailed(String),
+    InstallFailed(String),
+}
+
+impl UpdateStatus {
+    fn label(&self) -> String {
+        match self {
+            Self::Checking => "Checking for updates…".into(),
+            Self::Current => format!("Up to date (v{})", env!("CARGO_PKG_VERSION")),
+            Self::Available(version) => format!("Install {version}…"),
+            Self::Installing(version) => format!("Installing {version}…"),
+            Self::Installed(version) => format!("Restart to finish {version}"),
+            Self::CheckFailed(error) => format!("Update check failed: {}", short_error(error)),
+            Self::InstallFailed(error) => format!("Update failed: {}", short_error(error)),
+        }
+    }
+}
+
+fn short_error(error: &str) -> String {
+    error
+        .lines()
+        .next()
+        .unwrap_or("unknown error")
+        .chars()
+        .take(90)
+        .collect()
+}
+
+enum UpdateCommand {
+    Check,
+    Install(String),
+}
+
+/// Network access runs separately from the display worker and the menu loop.
+/// Check at launch, then daily or when the user requests it.
+fn update_worker(
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
+    rx: mpsc::Receiver<UpdateCommand>,
+) {
+    let mut command = UpdateCommand::Check;
+    loop {
+        match command {
+            UpdateCommand::Check => {
+                let _ = proxy.send_event(UserEvent::UpdateChecking);
+                let result = updates::check_latest();
+                if let Err(error) = &result {
+                    eprintln!("update check failed: {error}");
+                }
+                let _ = proxy.send_event(UserEvent::UpdateChecked(result));
+            }
+            UpdateCommand::Install(tag) => {
+                let _ = proxy.send_event(UserEvent::UpdateInstalling(tag.clone()));
+                let result = updates::install(&tag);
+                if let Err(error) = &result {
+                    eprintln!("update install failed: {error}");
+                }
+                let _ = proxy.send_event(UserEvent::UpdateInstalled(result));
+            }
+        }
+        command = match rx.recv_timeout(Duration::from_secs(24 * 60 * 60)) {
+            Ok(command) => command,
+            Err(mpsc::RecvTimeoutError::Timeout) => UpdateCommand::Check,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return,
+        };
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -330,11 +408,13 @@ struct MenuState {
     bind_items: Vec<(String, CheckMenuItem)>,
     toggle_items: Vec<(u32, CheckMenuItem)>,
     start_login: CheckMenuItem,
+    check_update: MenuItem,
+    update_status: MenuItem,
     signature: String,
 }
 
 impl MenuState {
-    fn build(snap: &Snapshot) -> MenuState {
+    fn build(snap: &Snapshot, update: &UpdateStatus) -> MenuState {
         let menu = Menu::new();
 
         let bind = Submenu::new("Auto-off built-in when connected", true);
@@ -396,6 +476,28 @@ impl MenuState {
             None,
         );
         let _ = menu.append(&start_login);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+        let check_update = MenuItem::with_id(
+            "check-update",
+            "Check for Updates…",
+            !matches!(
+                update,
+                UpdateStatus::Checking | UpdateStatus::Installing(_) | UpdateStatus::Installed(_)
+            ),
+            None,
+        );
+        let _ = menu.append(&check_update);
+        let update_status = MenuItem::with_id(
+            "update-action",
+            update.label(),
+            matches!(
+                update,
+                UpdateStatus::Available(_) | UpdateStatus::Installed(_)
+            ),
+            None,
+        );
+        let _ = menu.append(&update_status);
+        let _ = menu.append(&PredefinedMenuItem::separator());
         let quit = MenuItem::with_id("quit", "Quit lidup", true, None);
         let _ = menu.append(&quit);
 
@@ -405,6 +507,8 @@ impl MenuState {
             bind_items,
             toggle_items,
             start_login,
+            check_update,
+            update_status,
             signature: structural_signature(snap),
         }
     }
@@ -434,6 +538,18 @@ impl MenuState {
         self.start_login.set_checked(snap.launch_at_login);
         false
     }
+
+    fn set_update_status(&self, status: &UpdateStatus) {
+        self.check_update.set_enabled(!matches!(
+            status,
+            UpdateStatus::Checking | UpdateStatus::Installing(_) | UpdateStatus::Installed(_)
+        ));
+        self.update_status.set_text(status.label());
+        self.update_status.set_enabled(matches!(
+            status,
+            UpdateStatus::Available(_) | UpdateStatus::Installed(_)
+        ));
+    }
 }
 
 /// Stable identity of the display list: the ordered set of display ids + keys.
@@ -453,6 +569,8 @@ fn structural_signature(snap: &Snapshot) -> String {
 
 struct App {
     cmd_tx: mpsc::Sender<WorkerEvent>,
+    update_tx: mpsc::Sender<UpdateCommand>,
+    update_status: UpdateStatus,
     tray: Option<TrayIcon>,
     menu: Option<MenuState>,
     snapshot: Option<Snapshot>,
@@ -466,7 +584,7 @@ impl ApplicationHandler<UserEvent> for App {
             // tray menu right after startup.
             let settings = Settings::load();
             let snap = *snapshot(&settings);
-            let ms = MenuState::build(&snap);
+            let ms = MenuState::build(&snap, &self.update_status);
             let icon = tray_image();
             match TrayIconBuilderCompat::build(icon, ms.menu.clone()) {
                 Ok(t) => self.tray = Some(t),
@@ -486,7 +604,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // changed (hot-plug), which is when we rebuild the menu.
                     Some(ms) => ms.update(&snap),
                     None => {
-                        let first = MenuState::build(&snap);
+                        let first = MenuState::build(&snap, &self.update_status);
                         if let Some(tray) = &self.tray {
                             tray.set_menu(Some(Box::new(first.menu.clone())));
                         }
@@ -495,7 +613,7 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 };
                 if rebuild {
-                    let fresh = MenuState::build(&snap);
+                    let fresh = MenuState::build(&snap, &self.update_status);
                     if let Some(tray) = &self.tray {
                         tray.set_menu(Some(Box::new(fresh.menu.clone())));
                     }
@@ -503,10 +621,74 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 self.snapshot = Some(snap);
             }
+            UserEvent::UpdateChecking => {
+                self.update_status = UpdateStatus::Checking;
+                if let Some(menu) = &self.menu {
+                    menu.set_update_status(&self.update_status);
+                }
+            }
+            UserEvent::UpdateChecked(result) => {
+                self.update_status = match result {
+                    Ok(Some(version)) => UpdateStatus::Available(version),
+                    Ok(None) => UpdateStatus::Current,
+                    Err(error) => UpdateStatus::CheckFailed(error),
+                };
+                if let Some(menu) = &self.menu {
+                    menu.set_update_status(&self.update_status);
+                }
+            }
+            UserEvent::UpdateInstalling(tag) => {
+                self.update_status = UpdateStatus::Installing(tag);
+                if let Some(menu) = &self.menu {
+                    menu.set_update_status(&self.update_status);
+                }
+            }
+            UserEvent::UpdateInstalled(result) => {
+                self.update_status = match result {
+                    Ok(tag) => UpdateStatus::Installed(tag),
+                    Err(error) => UpdateStatus::InstallFailed(error),
+                };
+                if let Some(menu) = &self.menu {
+                    menu.set_update_status(&self.update_status);
+                }
+            }
             UserEvent::Menu(ev) => {
                 let id = ev.id();
                 if id == "quit" {
                     let _ = self.cmd_tx.send(WorkerEvent::Quit);
+                } else if id == "check-update" {
+                    if !matches!(
+                        self.update_status,
+                        UpdateStatus::Checking
+                            | UpdateStatus::Installing(_)
+                            | UpdateStatus::Installed(_)
+                    ) {
+                        self.update_status = UpdateStatus::Checking;
+                        if let Some(menu) = &self.menu {
+                            menu.set_update_status(&self.update_status);
+                        }
+                        let _ = self.update_tx.send(UpdateCommand::Check);
+                    }
+                } else if id == "update-action" {
+                    match &self.update_status {
+                        UpdateStatus::Available(tag) => {
+                            let tag = tag.clone();
+                            self.update_status = UpdateStatus::Installing(tag.clone());
+                            if let Some(menu) = &self.menu {
+                                menu.set_update_status(&self.update_status);
+                            }
+                            let _ = self.update_tx.send(UpdateCommand::Install(tag));
+                        }
+                        UpdateStatus::Installed(_) => {
+                            let Err(error) = self_update::restart::restart();
+                            eprintln!("could not restart updated app: {error}");
+                            self.update_status = UpdateStatus::InstallFailed(error.to_string());
+                            if let Some(menu) = &self.menu {
+                                menu.set_update_status(&self.update_status);
+                            }
+                        }
+                        _ => {}
+                    }
                 } else if id == "start-login" {
                     // Toggle based on the state shown in the menu (cached), so the
                     // action matches the checkmark. No SMAppService query per click.
@@ -647,9 +829,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = reconfig_tx.send(WorkerEvent::DisplayChanged);
     });
 
+    let update_proxy = proxy.clone();
     std::thread::Builder::new()
         .name("lidup-worker".into())
         .spawn(move || worker(proxy, cmd_rx))?;
+
+    let (update_tx, update_rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("lidup-updates".into())
+        .spawn(move || update_worker(update_proxy, update_rx))?;
 
     // Evaluate once on launch (applies the auto rule to the current state and
     // publishes the first snapshot) so the menu is populated immediately.
@@ -661,6 +849,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let mut app = App {
         cmd_tx,
+        update_tx,
+        update_status: UpdateStatus::Checking,
         tray: None,
         menu: None,
         snapshot: None,

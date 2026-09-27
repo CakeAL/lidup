@@ -15,6 +15,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Verify release version
+        run: |
+          APP_VERSION=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
+          test "$GITHUB_REF_NAME" = "v$APP_VERSION"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
