@@ -67,25 +67,26 @@ enum UpdateStatus {
 impl UpdateStatus {
     fn label(&self) -> String {
         match self {
-            Self::Checking => "Checking for updates…".into(),
-            Self::Current => format!("Up to date (v{})", env!("CARGO_PKG_VERSION")),
-            Self::Available(version) => format!("Install {version}…"),
-            Self::Installing(version) => format!("Installing {version}…"),
-            Self::Installed(version) => format!("Restart to finish {version}"),
-            Self::CheckFailed(error) => format!("Update check failed: {}", short_error(error)),
-            Self::InstallFailed(error) => format!("Update failed: {}", short_error(error)),
+            Self::Checking => "正在检查更新…".into(),
+            Self::Current => format!("已是最新版本 · v{}", env!("CARGO_PKG_VERSION")),
+            Self::Available(version) => format!("下载并安装 {version}…"),
+            Self::Installing(version) => format!("正在安装 {version}…"),
+            Self::Installed(version) => format!("重启以完成 {version} 更新"),
+            Self::CheckFailed(error) => format!("检查更新失败：{}", short_error(error)),
+            Self::InstallFailed(error) => format!("安装更新失败：{}", short_error(error)),
         }
     }
 }
 
 fn short_error(error: &str) -> String {
-    error
-        .lines()
-        .next()
-        .unwrap_or("unknown error")
-        .chars()
-        .take(90)
-        .collect()
+    let line = error.lines().next().unwrap_or("未知错误").trim();
+    let mut chars = line.chars();
+    let label: String = chars.by_ref().take(54).collect();
+    if chars.next().is_some() {
+        format!("{label}…")
+    } else {
+        label
+    }
 }
 
 enum UpdateCommand {
@@ -378,7 +379,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
 
 fn dims(d: &DisplayInfo) -> String {
     if d.width > 0 && d.height > 0 {
-        format!(" [{}x{}]", d.width, d.height)
+        format!(" · {} × {}", d.width, d.height)
     } else {
         String::new()
     }
@@ -386,15 +387,25 @@ fn dims(d: &DisplayInfo) -> String {
 
 fn toggle_label(d: &DisplayInfo) -> String {
     format!(
-        "{}{}  {}",
+        "{}{}  ·  {}",
         d.name,
         dims(d),
-        if d.on { "▶ on" } else { "■ off" }
+        if d.on { "已开启" } else { "已关闭" }
     )
 }
 
+fn auto_summary(snap: &Snapshot) -> String {
+    match snap.bound.as_deref() {
+        None => "自动关闭内建屏：未启用".into(),
+        Some(key) => match snap.displays.iter().find(|d| d.key == key) {
+            Some(display) => format!("自动关闭内建屏：{}", display.name),
+            None => "自动关闭内建屏：等待已绑定显示器".into(),
+        },
+    }
+}
+
 /// The set of menu items currently shown. **Structural identity** (which displays
-/// are present, in order, plus the bound selection) is tracked via `signature`.
+/// are present, in order) is tracked via `signature`.
 ///
 /// - While the signature is unchanged (a display on/off state or bound selection
 ///   changed) we mutate the existing items' checked/label **in place** — no rebuild,
@@ -404,6 +415,7 @@ fn toggle_label(d: &DisplayInfo) -> String {
 ///   and almost never while you're clicking it).
 struct MenuState {
     menu: Menu,
+    auto_summary: MenuItem,
     bind_none: CheckMenuItem,
     bind_items: Vec<(String, CheckMenuItem)>,
     toggle_items: Vec<(u32, CheckMenuItem)>,
@@ -417,14 +429,40 @@ impl MenuState {
     fn build(snap: &Snapshot, update: &UpdateStatus) -> MenuState {
         let menu = Menu::new();
 
-        let bind = Submenu::new("Auto-off built-in when connected", true);
-        let bind_none = CheckMenuItem::with_id(
-            "bind:none",
-            "None (manual only)",
-            true,
-            snap.bound.is_none(),
+        let title = MenuItem::with_id(
+            "app-title",
+            format!("lidup  ·  v{}", env!("CARGO_PKG_VERSION")),
+            false,
             None,
         );
+        let _ = menu.append(&title);
+        let auto_summary = MenuItem::with_id("auto-summary", auto_summary(snap), false, None);
+        let _ = menu.append(&auto_summary);
+        let _ = menu.append(&PredefinedMenuItem::separator());
+
+        let displays_heading = MenuItem::with_id("displays-heading", "显示器", false, None);
+        let _ = menu.append(&displays_heading);
+        let mut toggle_items = Vec::new();
+        for d in &snap.displays {
+            let item = CheckMenuItem::with_id(
+                "toggle:".to_string() + &d.id.to_string(),
+                toggle_label(d),
+                true,
+                d.on,
+                None,
+            );
+            let _ = menu.append(&item);
+            toggle_items.push((d.id, item));
+        }
+        if !snap.control_ok {
+            let note = MenuItem::with_id("note", "当前无法控制显示器", false, None);
+            let _ = menu.append(&note);
+        }
+        let _ = menu.append(&PredefinedMenuItem::separator());
+
+        let bind = Submenu::new("自动关闭内建屏", true);
+        let bind_none =
+            CheckMenuItem::with_id("bind:none", "不自动关闭", true, snap.bound.is_none(), None);
         let _ = bind.append(&bind_none);
         let mut bind_items = Vec::new();
         for d in &snap.displays {
@@ -442,35 +480,9 @@ impl MenuState {
             bind_items.push((d.key.clone(), item));
         }
         let _ = menu.append(&bind);
-        let _ = menu.append(&PredefinedMenuItem::separator());
-
-        let mut toggle_items = Vec::new();
-        for d in &snap.displays {
-            let item = CheckMenuItem::with_id(
-                "toggle:".to_string() + &d.id.to_string(),
-                toggle_label(d),
-                true,
-                d.on,
-                None,
-            );
-            let _ = menu.append(&item);
-            toggle_items.push((d.id, item));
-        }
-
-        let _ = menu.append(&PredefinedMenuItem::separator());
-        if !snap.control_ok {
-            let note = MenuItem::with_id(
-                "note",
-                "Display control unavailable on this Mac",
-                false,
-                None,
-            );
-            let _ = menu.append(&note);
-            let _ = menu.append(&PredefinedMenuItem::separator());
-        }
         let start_login = CheckMenuItem::with_id(
             "start-login",
-            "Start at Login",
+            "登录时启动",
             true,
             snap.launch_at_login,
             None,
@@ -479,7 +491,7 @@ impl MenuState {
         let _ = menu.append(&PredefinedMenuItem::separator());
         let check_update = MenuItem::with_id(
             "check-update",
-            "Check for Updates…",
+            "检查更新…",
             !matches!(
                 update,
                 UpdateStatus::Checking | UpdateStatus::Installing(_) | UpdateStatus::Installed(_)
@@ -498,11 +510,12 @@ impl MenuState {
         );
         let _ = menu.append(&update_status);
         let _ = menu.append(&PredefinedMenuItem::separator());
-        let quit = MenuItem::with_id("quit", "Quit lidup", true, None);
+        let quit = MenuItem::with_id("quit", "退出 lidup", true, None);
         let _ = menu.append(&quit);
 
         MenuState {
             menu,
+            auto_summary,
             bind_none,
             bind_items,
             toggle_items,
@@ -523,6 +536,7 @@ impl MenuState {
         }
         self.signature = sig;
 
+        self.auto_summary.set_text(auto_summary(snap));
         self.bind_none.set_checked(snap.bound.is_none());
         for (key, item) in &self.bind_items {
             item.set_checked(snap.bound.as_deref() == Some(key.as_str()));
@@ -738,36 +752,41 @@ impl TrayIconBuilderCompat {
     fn build(icon: tray_icon::Icon, menu: Menu) -> Result<TrayIcon, tray_icon::Error> {
         tray_icon::TrayIconBuilder::new()
             .with_menu(Box::new(menu))
-            .with_tooltip("lidup — display control")
+            .with_tooltip("lidup · 显示器管理")
             .with_icon(icon)
             .with_icon_as_template(true)
             .build()
     }
 }
 
-/// A simple 24x24 black glyph (template so macOS auto-tints it for the menu bar).
+/// A crisp monitor outline with a stand. macOS tints the template for light/dark menus.
 fn tray_image() -> tray_icon::Icon {
     let (w, h) = (24u32, 24u32);
     let mut rgba = vec![0u8; (w * h * 4) as usize];
-    let cx = 12.0;
-    let cy = 12.0;
-    let r = 9.5;
     for y in 0..h {
         for x in 0..w {
-            let dx = (x as f64) + 0.5 - cx;
-            let dy = (y as f64) + 0.5 - cy;
-            let dist = (dx * dx + dy * dy).sqrt();
-            if dist <= r {
-                let i = ((y * w + x) * 4) as usize;
-                // filled disc with a hollow center ring for a "screen" look
-                rgba[i + 0] = 0;
-                rgba[i + 1] = 0;
-                rgba[i + 2] = 0;
-                rgba[i + 3] = if dist > r - 2.5 { 255 } else { 190 };
+            let mut covered = 0u8;
+            for sub_y in 0..4 {
+                for sub_x in 0..4 {
+                    let px = x as f64 + (sub_x as f64 + 0.5) / 4.0;
+                    let py = y as f64 + (sub_y as f64 + 0.5) / 4.0;
+                    let outer = rounded_rect_contains(px, py, 12.0, 9.5, 10.0, 7.0, 2.0);
+                    let inner = rounded_rect_contains(px, py, 12.0, 9.2, 8.1, 4.9, 0.7);
+                    let stem = (11.0..=13.0).contains(&px) && (16.4..=20.2).contains(&py);
+                    let foot = rounded_rect_contains(px, py, 12.0, 20.8, 4.7, 0.8, 0.8);
+                    covered += u8::from((outer && !inner) || stem || foot);
+                }
             }
+            rgba[((y * w + x) * 4 + 3) as usize] = ((covered as u16 * 255) / 16) as u8;
         }
     }
     tray_icon::Icon::from_rgba(rgba, w, h).expect("valid rgba icon")
+}
+
+fn rounded_rect_contains(x: f64, y: f64, cx: f64, cy: f64, hx: f64, hy: f64, r: f64) -> bool {
+    let qx = (x - cx).abs() - (hx - r);
+    let qy = (y - cy).abs() - (hy - r);
+    qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) <= r
 }
 
 // ---------------------------------------------------------------------------
