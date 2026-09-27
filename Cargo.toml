@@ -1,6 +1,6 @@
 [package]
 name = "lidup"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 
 [dependencies]
@@ -15,6 +15,8 @@ winit = "0.30"
 tray-icon = "0.24"
 objc2 = "0.6"
 objc2-app-kit = "0.3"
+objc2-foundation = "0.3"
+block2 = "0.6"
 smappservice-rs = "0.1.3"
 anyhow = "1"
 signal-hook = "0.3"

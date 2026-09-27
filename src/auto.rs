@@ -8,6 +8,11 @@ fn bound_present(list: &[displays::DisplayInfo], key: &str) -> bool {
     list.iter().any(|d| !d.builtin && d.key == key)
 }
 
+fn bound_ready(list: &[displays::DisplayInfo], key: &str) -> bool {
+    list.iter()
+        .any(|d| !d.builtin && d.key == key && d.on && !d.asleep)
+}
+
 /// Pure decision: if a change is needed, return the built-in id to set and the
 /// desired state. `None` means "leave the built-in alone".
 pub fn decide(settings: &Settings, list: &[displays::DisplayInfo]) -> Option<(u32, bool)> {
@@ -23,6 +28,11 @@ pub fn decide(settings: &Settings, list: &[displays::DisplayInfo]) -> Option<(u3
     }
 
     if present {
+        // A waking external display can be online before it is active. Turning
+        // off the built-in then reconfigures the display set during HDR setup.
+        if !bound_ready(list, bound) {
+            return None;
+        }
         // The bound external is connected: keep the built-in off.
         if builtin.on {
             Some((builtin.id, false))
@@ -68,7 +78,7 @@ pub fn apply_auto_with_list(settings: &mut Settings, list: &[displays::DisplayIn
     let builtin_on = list.iter().find(|d| d.builtin).map_or(false, |b| b.on);
 
     if present {
-        if builtin_on {
+        if builtin_on && bound.is_some_and(|key| bound_ready(list, key)) {
             let _ = displays::set_enabled(bid, false);
         }
     } else if settings.restore_builtin && !builtin_on {
@@ -177,5 +187,17 @@ mod tests {
         );
         builtin.on = false;
         assert_eq!(decide(&s, &[builtin]), None);
+    }
+
+    #[test]
+    fn waking_external_does_not_turn_off_builtin() {
+        let s = settings(Some("ext:1"), true);
+        let builtin = disp(1, true, true, "builtin");
+        let mut external = disp(2, false, true, "ext:1");
+        external.asleep = true;
+        assert_eq!(decide(&s, &[builtin.clone(), external.clone()]), None);
+        external.asleep = false;
+        external.on = false;
+        assert_eq!(decide(&s, &[builtin, external]), None);
     }
 }

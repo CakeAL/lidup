@@ -18,6 +18,7 @@ lidup 是 macOS 菜单栏程序。用户选定一台外接显示器后，程序�
 
 - 显示器状态在睡眠、唤醒和插拔期间会短暂变化。`CGDisplayRegisterReconfigurationCallback` 的 begin 通知发生在配置完成前，只应在完成通知后读取最终显示器状态，并合并短时间内重复的回调。
 - `CGDisplayIsAsleep` 与 `CGDisplayIsActive` 含义不同。内建屏睡眠时不要调用显示配置 API；外接屏短暂离线时不要立即恢复内建屏。额外的显示配置可能重置外接屏的 HDR 设置。
+- 通过 `NSWorkspace` 的整机和屏幕睡眠/唤醒通知暂停唤醒后的自动关屏；唤醒后 CoreGraphics 可能暂时把内建屏报告为已开启，不得因此再次调用 `CGSConfigureDisplayEnabled`。绑定外接屏确实持续缺席超过唤醒保护期后才能重新启用自动关屏；断线恢复内建屏仍按五秒确认执行。
 - 自动模式只管理内建屏；手动切换显示器后关闭自动模式。关屏操作必须保留至少一块可用显示器。关闭程序时恢复内建屏。
 - 被软件关闭的内建屏可能不在 `CGGetOnlineDisplayList` 结果中；使用配置中缓存的显示器 ID 恢复。恢复操作会调用私有 API，应避免无条件或重复执行。
 - 更新检查和安装必须在独立线程执行，不能阻塞菜单事件循环或显示器 worker。GitHub 请求有超时；网络或安装失败只影响更新状态。`self_update` 安装整个 `lidup.app`，从 Release 中选择 `lidup.zip` 并验证解压后的应用签名；更新完成后从菜单重启。应用版本来自 `CARGO_PKG_VERSION`；`pack.sh` 从 `Cargo.toml` 读取包版本写入 `Info.plist`。

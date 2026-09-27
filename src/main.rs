@@ -8,8 +8,16 @@
 
 use lidup::{auto, config, displays, launch, updates};
 
+use block2::RcBlock;
 use config::Settings;
 use displays::DisplayInfo;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_app_kit::{
+    NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceScreensDidSleepNotification,
+    NSWorkspaceScreensDidWakeNotification, NSWorkspaceWillSleepNotification,
+};
+use objc2_foundation::{NSNotification, NSNotificationCenter, NSObjectProtocol};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
@@ -23,6 +31,7 @@ use tray_icon::TrayIcon;
 struct Snapshot {
     displays: Vec<DisplayInfo>,
     bound: Option<String>,
+    auto_off_suppressed: bool,
     control_ok: bool,
     /// Whether launching at login is currently enabled.
     launch_at_login: bool,
@@ -39,6 +48,9 @@ enum WorkerEvent {
     SetBound(Option<String>),
     /// Enable (`true`) / disable (`false`) launch-at-login. `None` = no change.
     SetLaunchAtLogin(Option<bool>),
+    /// NSWorkspace reports that the Mac or its displays are sleeping/waking.
+    PowerSleep,
+    PowerWake,
     Quit,
 }
 
@@ -132,7 +144,7 @@ fn update_worker(
 // Worker thread (owns the settings + the actual display control)
 // ---------------------------------------------------------------------------
 
-fn snapshot(settings: &Settings) -> Box<Snapshot> {
+fn snapshot(settings: &Settings, auto_off_suppressed: bool) -> Box<Snapshot> {
     let mut list = displays::online_displays();
     // A powered-off built-in leaves the online list; re-add it so the user can
     // always toggle it back on from the menu. It must use the built-in's *stable*
@@ -166,6 +178,7 @@ fn snapshot(settings: &Settings) -> Box<Snapshot> {
     Box::new(Snapshot {
         displays: list,
         bound: settings.bound_key.clone(),
+        auto_off_suppressed,
         control_ok: displays::control_available(),
         // Use the cached flag (queried once at startup and refreshed only when the
         // user toggles it) — we never call into SMAppService on every snapshot.
@@ -183,6 +196,53 @@ fn needs_builtin_restore(
         || (bound_was_present && !another_external_on)
 }
 
+/// Prevent a wake-time CoreGraphics state transition from causing another
+/// private display reconfiguration. A cable pull still restores the built-in
+/// through the normal five-second absence path.
+#[derive(Default)]
+struct WakeGuard {
+    sleeping: bool,
+    suppress_auto_off: bool,
+    grace_until: Option<Instant>,
+    absent_since: Option<Instant>,
+}
+
+impl WakeGuard {
+    fn sleep(&mut self) {
+        self.sleeping = true;
+        self.suppress_auto_off = true;
+        self.grace_until = None;
+        self.absent_since = None;
+    }
+
+    fn wake(&mut self, now: Instant) {
+        self.sleeping = false;
+        self.suppress_auto_off = true;
+        self.grace_until = Some(now + Duration::from_secs(60));
+        self.absent_since = None;
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn observe_bound(&mut self, present: bool, now: Instant) {
+        if present {
+            self.absent_since = None;
+            return;
+        }
+        let absent_since = *self.absent_since.get_or_insert(now);
+        if now.duration_since(absent_since) >= Duration::from_secs(5)
+            && self.grace_until.is_none_or(|deadline| now >= deadline)
+        {
+            // The bound monitor stayed away beyond the wake grace period: a
+            // subsequent connection is a new plug, so the auto rule may run.
+            self.suppress_auto_off = false;
+            self.grace_until = None;
+        }
+    }
+}
+
 /// Re-evaluate the current display situation and publish a fresh snapshot.
 ///
 /// A bound monitor must remain absent for five seconds before the built-in is
@@ -193,6 +253,7 @@ fn refresh(
     settings: &mut Settings,
     missing_since: &mut Option<Instant>,
     bound_was_present: &mut bool,
+    wake_guard: &mut WakeGuard,
 ) -> Option<Instant> {
     // auto = None means the user wants full manual control: do NOT touch the built-in
     // at all (no auto-off, no auto-restore). Otherwise the app would fight the user —
@@ -201,7 +262,12 @@ fn refresh(
     if settings.bound_key.is_none() {
         *missing_since = None;
         *bound_was_present = false;
-        let _ = proxy.send_event(UserEvent::Snapshot(snapshot(settings)));
+        wake_guard.reset();
+        let _ = proxy.send_event(UserEvent::Snapshot(snapshot(settings, false)));
+        return None;
+    }
+
+    if wake_guard.sleeping {
         return None;
     }
 
@@ -216,13 +282,16 @@ fn refresh(
     let bound_present = displays_now
         .iter()
         .any(|d| !d.builtin && Some(d.key.as_str()) == settings.bound_key.as_deref());
+    wake_guard.observe_bound(bound_present, Instant::now());
     let mut retry_at = None;
     if bound_present {
         *missing_since = None;
         *bound_was_present = true;
         // Do not run the auto rule against a transiently missing external during
         // wake: its restore path performs a permanent display configuration.
-        auto::apply_auto_with_list(settings, &displays_now);
+        if !wake_guard.suppress_auto_off {
+            auto::apply_auto_with_list(settings, &displays_now);
+        }
     } else {
         // Only an online built-in has a trustworthy sleep state. A display
         // disabled by this app is absent from the online list and querying its
@@ -261,7 +330,10 @@ fn refresh(
     if settings.builtin_id != before_id || settings.builtin_key != before_key {
         let _ = settings.save();
     }
-    let _ = proxy.send_event(UserEvent::Snapshot(snapshot(settings)));
+    let _ = proxy.send_event(UserEvent::Snapshot(snapshot(
+        settings,
+        wake_guard.suppress_auto_off,
+    )));
     // A cable pull does not always emit a CoreGraphics callback. Check again
     // while auto mode is active so an unplug cannot leave the built-in dark.
     let watchdog = Instant::now() + Duration::from_secs(2);
@@ -270,7 +342,12 @@ fn refresh(
 
 #[cfg(test)]
 mod worker_tests {
-    use super::needs_builtin_restore;
+    use super::{needs_builtin_restore, observe_power_events, WakeGuard, WorkerEvent};
+    use objc2_app_kit::{
+        NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceWillSleepNotification,
+    };
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn unplug_restores_even_if_coregraphics_still_reports_builtin_active() {
@@ -286,6 +363,62 @@ mod worker_tests {
     fn another_external_keeps_manual_restore_setting() {
         assert!(!needs_builtin_restore(false, true, false, true));
     }
+
+    #[test]
+    fn wake_does_not_reapply_auto_off_when_monitor_returns() {
+        let now = Instant::now();
+        let mut guard = WakeGuard::default();
+        guard.sleep();
+        guard.wake(now);
+        guard.observe_bound(false, now + Duration::from_secs(2));
+        guard.observe_bound(true, now + Duration::from_secs(12));
+        guard.observe_bound(true, now + Duration::from_secs(70));
+        assert!(guard.suppress_auto_off);
+    }
+
+    #[test]
+    fn confirmed_unplug_rearms_auto_off_after_wake() {
+        let now = Instant::now();
+        let mut guard = WakeGuard::default();
+        guard.wake(now);
+        guard.observe_bound(false, now + Duration::from_secs(2));
+        guard.observe_bound(false, now + Duration::from_secs(7));
+        assert!(guard.suppress_auto_off);
+        guard.observe_bound(false, now + Duration::from_secs(61));
+        assert!(!guard.suppress_auto_off);
+    }
+
+    #[test]
+    fn brief_unplug_after_wake_does_not_rearm_auto_off() {
+        let now = Instant::now();
+        let mut guard = WakeGuard::default();
+        guard.wake(now);
+        guard.observe_bound(true, now + Duration::from_secs(61));
+        guard.observe_bound(false, now + Duration::from_secs(62));
+        guard.observe_bound(true, now + Duration::from_secs(64));
+        assert!(guard.suppress_auto_off);
+    }
+
+    #[test]
+    fn workspace_power_notifications_reach_worker() {
+        let (tx, rx) = mpsc::channel();
+        let _observers = observe_power_events(tx);
+        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        unsafe {
+            center.postNotificationName_object(NSWorkspaceWillSleepNotification, None);
+        }
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WorkerEvent::PowerSleep
+        ));
+        unsafe {
+            center.postNotificationName_object(NSWorkspaceDidWakeNotification, None);
+        }
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WorkerEvent::PowerWake
+        ));
+    }
 }
 
 fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receiver<WorkerEvent>) {
@@ -300,6 +433,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
 
     let mut missing_since = None;
     let mut bound_was_present = false;
+    let mut wake_guard = WakeGuard::default();
     let mut pending_refresh: Option<Instant> = None;
 
     // Coalesce the per-display callbacks into one settled snapshot. A single
@@ -319,6 +453,17 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                     pending_refresh = Some(Instant::now() + Duration::from_millis(700));
                     continue;
                 }
+                WorkerEvent::PowerSleep => {
+                    wake_guard.sleep();
+                    pending_refresh = None;
+                    continue;
+                }
+                WorkerEvent::PowerWake => {
+                    wake_guard.wake(Instant::now());
+                    missing_since = None;
+                    pending_refresh = Some(Instant::now() + Duration::from_millis(700));
+                    continue;
+                }
                 WorkerEvent::Toggle(id) => {
                     // A manual toggle is an explicit user override: disable the
                     // auto-off rule so it doesn't immediately fight the change.
@@ -329,6 +474,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                     let _ = displays::toggle_safe(id);
                 }
                 WorkerEvent::SetBound(key) => {
+                    wake_guard.reset();
                     let going_to_manual = key.is_none();
                     settings.bound_key = key;
                     let _ = settings.save();
@@ -369,6 +515,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
             &mut settings,
             &mut missing_since,
             &mut bound_was_present,
+            &mut wake_guard,
         );
     }
 }
@@ -395,6 +542,9 @@ fn toggle_label(d: &DisplayInfo) -> String {
 }
 
 fn auto_summary(snap: &Snapshot) -> String {
+    if snap.auto_off_suppressed && snap.displays.iter().any(|d| d.builtin && d.on) {
+        return "自动关闭内建屏：唤醒后暂停（保护 HDR）".into();
+    }
     match snap.bound.as_deref() {
         None => "自动关闭内建屏：未启用".into(),
         Some(key) => match snap.displays.iter().find(|d| d.key == key) {
@@ -597,7 +747,7 @@ impl ApplicationHandler<UserEvent> for App {
             // so the first worker-sent snapshot matches and we never rebuild the
             // tray menu right after startup.
             let settings = Settings::load();
-            let snap = *snapshot(&settings);
+            let snap = *snapshot(&settings, false);
             let ms = MenuState::build(&snap, &self.update_status);
             let icon = tray_image();
             match TrayIconBuilderCompat::build(icon, ms.menu.clone()) {
@@ -793,6 +943,53 @@ fn rounded_rect_contains(x: f64, y: f64, cx: f64, cy: f64, hx: f64, hy: f64, r: 
 // Entry point
 // ---------------------------------------------------------------------------
 
+struct PowerObservers {
+    center: Retained<NSNotificationCenter>,
+    tokens: Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>,
+}
+
+impl Drop for PowerObservers {
+    fn drop(&mut self) {
+        for token in &self.tokens {
+            let protocol: &ProtocolObject<dyn NSObjectProtocol> = token;
+            let observer: &objc2::runtime::AnyObject = protocol.as_ref();
+            unsafe { self.center.removeObserver(observer) };
+        }
+    }
+}
+
+/// NSWorkspace notifications identify sleep/wake explicitly. Display-change
+/// callbacks alone cannot distinguish a waking monitor from a cable pull.
+fn observe_power_events(tx: mpsc::Sender<WorkerEvent>) -> PowerObservers {
+    let center = NSWorkspace::sharedWorkspace().notificationCenter();
+    let notifications = unsafe {
+        [
+            (NSWorkspaceWillSleepNotification, true),
+            (NSWorkspaceScreensDidSleepNotification, true),
+            (NSWorkspaceDidWakeNotification, false),
+            (NSWorkspaceScreensDidWakeNotification, false),
+        ]
+    };
+    let tokens = notifications
+        .into_iter()
+        .map(|(name, sleeping)| {
+            let tx = tx.clone();
+            let block = RcBlock::new(move |_notification: std::ptr::NonNull<NSNotification>| {
+                let event = if sleeping {
+                    WorkerEvent::PowerSleep
+                } else {
+                    WorkerEvent::PowerWake
+                };
+                let _ = tx.send(event);
+            });
+            unsafe {
+                center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
+            }
+        })
+        .collect();
+    PowerObservers { center, tokens }
+}
+
 /// If lidup is terminated (SIGTERM/SIGINT/SIGHUP — e.g. the OS kills the login
 /// item when it is unticked in System Settings, or the app is quit externally),
 /// restore the built-in display so the user is never left with a dark screen.
@@ -841,6 +1038,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Event-driven worker: wake it on display changes and on manual actions.
     let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerEvent>();
+    let _power_observers = observe_power_events(cmd_tx.clone());
 
     // Fire whenever a display is inserted/removed/powered — forwards to the worker.
     let reconfig_tx = cmd_tx.clone();
