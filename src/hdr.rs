@@ -166,6 +166,7 @@ pub struct HdrRecovery {
     bound_key: Option<String>,
     last_enabled: bool,
     off_since: Option<Instant>,
+    last_check: Option<Instant>,
     pending: bool,
     ready_at: Option<Instant>,
     expires_at: Option<Instant>,
@@ -187,6 +188,7 @@ impl HdrRecovery {
     }
 
     pub fn wake(&mut self, now: Instant) {
+        self.last_check = None;
         if self.last_enabled {
             self.pending = true;
             self.ready_at = Some(now + Duration::from_secs(3));
@@ -198,7 +200,44 @@ impl HdrRecovery {
     /// Called only for an active, awake bound monitor. Returns the next time a
     /// pending restore should be checked; normal HDR state is sampled otherwise.
     pub fn observe(&mut self, id: u32, now: Instant) -> Option<Instant> {
+        // Constructing MPDisplayMgr enumerates every mode on every monitor.
+        // A two-second display watchdog must not rebuild it every time.
+        if !self.background_sample_due(now) {
+            return None;
+        }
+        self.observe_now(id, now)
+    }
+
+    fn background_sample_due(&self, now: Instant) -> bool {
+        self.pending
+            || self
+                .last_check
+                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(30))
+    }
+
+    /// Read immediately before changing the display set, even if the normal
+    /// background sample was recent.
+    pub fn observe_now(&mut self, id: u32, now: Instant) -> Option<Instant> {
+        self.last_check = Some(now);
         self.observe_with(id, now, state, enable)
+    }
+
+    pub fn request_observation(&mut self) {
+        self.last_check = None;
+    }
+
+    /// A live reading before sleep or a display change takes precedence over an
+    /// older sample. The caller must confirm the monitor is active and awake.
+    pub fn capture_current_preference(&mut self, id: u32) {
+        if self.pending {
+            // SDR can be transient while an earlier HDR recovery is in flight.
+            return;
+        }
+        if let Some(current) = state(id).filter(|state| state.supported) {
+            self.last_enabled = current.enabled;
+            self.off_since = None;
+            self.last_check = Some(Instant::now());
+        }
     }
 
     fn observe_with(
@@ -348,6 +387,21 @@ mod tests {
         );
         recovery.wake(now + Duration::from_secs(10));
         assert!(!recovery.restore_pending());
+    }
+
+    #[test]
+    fn background_hdr_reads_are_sparse_but_wake_is_immediate() {
+        let now = Instant::now();
+        let mut recovery = HdrRecovery::default();
+        assert!(recovery.background_sample_due(now));
+        recovery.last_check = Some(now);
+        assert!(!recovery.background_sample_due(now + Duration::from_secs(29)));
+        assert!(recovery.background_sample_due(now + Duration::from_secs(30)));
+        recovery.request_observation();
+        assert!(recovery.background_sample_due(now + Duration::from_secs(1)));
+        recovery.last_enabled = true;
+        recovery.wake(now + Duration::from_secs(1));
+        assert!(recovery.background_sample_due(now + Duration::from_secs(1)));
     }
 
     #[test]

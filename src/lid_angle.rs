@@ -239,6 +239,10 @@ impl Gate {
         self.open
     }
 
+    pub fn settling(&self) -> bool {
+        self.candidate.is_some()
+    }
+
     pub fn observe(&mut self, angle: Option<u16>, now: Instant) -> bool {
         let (Some(threshold), Some(angle)) = (self.threshold, angle) else {
             // After a read failure, require a fresh settled reading instead of

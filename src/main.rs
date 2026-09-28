@@ -50,6 +50,7 @@ enum WorkerEvent {
     /// User selected the external monitor to auto-off (or None).
     SetBound(Option<String>),
     SetAngleThreshold(Option<u16>),
+    SampleAngle,
     /// Enable (`true`) / disable (`false`) launch-at-login. `None` = no change.
     SetLaunchAtLogin(Option<bool>),
     /// NSWorkspace reports that the Mac or its displays are sleeping/waking.
@@ -350,7 +351,7 @@ fn refresh(
             // Capture HDR before disabling the built-in. That configuration can
             // also make WindowServer recreate the external in SDR mode.
             if builtin_may_change {
-                let _ = hdr_recovery.observe(external.id, Instant::now());
+                hdr_recovery.capture_current_preference(external.id);
                 hdr_recovery.wake(Instant::now());
             }
         }
@@ -554,10 +555,22 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         // Start the absence confirmation after the latest completed
                         // reconfiguration, including one delivered on system wake.
                         missing_since = None;
+                        hdr_recovery.request_observation();
                         pending_refresh = Some(Instant::now() + Duration::from_millis(700));
                         continue;
                     }
                     WorkerEvent::PowerSleep => {
+                        if !wake_guard.sleeping {
+                            let external = displays::online_displays().into_iter().find(|d| {
+                                !d.builtin
+                                    && d.on
+                                    && !d.asleep
+                                    && Some(d.key.as_str()) == settings.bound_key.as_deref()
+                            });
+                            if let Some(external) = external {
+                                hdr_recovery.capture_current_preference(external.id);
+                            }
+                        }
                         diagnostics::record("power sleep");
                         wake_guard.sleep();
                         angle_reader.reset();
@@ -613,6 +626,9 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         angle_last_action = None;
                         next_angle_poll = Some(Instant::now());
                     }
+                    WorkerEvent::SampleAngle => {
+                        next_angle_poll = Some(Instant::now());
+                    }
                     WorkerEvent::SetLaunchAtLogin(enabled) => {
                         if let Some(enabled) = enabled {
                             let result = if enabled {
@@ -647,15 +663,19 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
             angle_gate.configure(settings.open_above_angle);
             let crossed = angle_gate.observe(current_angle, now);
             let interval = if settings.bound_key.is_some() && settings.open_above_angle.is_some() {
-                Duration::from_millis(250)
+                if angle_gate.settling() {
+                    Duration::from_millis(250)
+                } else {
+                    Duration::from_secs(1)
+                }
             } else {
-                Duration::from_secs(2)
+                Duration::from_secs(30)
             };
             next_angle_poll = Some(now + interval);
             if crossed
                 || angle_reader.available() != previous_available
                 || (current_angle != previous_angle
-                    && now.duration_since(last_angle_snapshot) >= Duration::from_secs(1))
+                    && now.duration_since(last_angle_snapshot) >= Duration::from_secs(2))
             {
                 // A display callback deliberately waits 700 ms for the hardware
                 // topology to settle. A sensor reading must not bypass that wait.
@@ -1105,7 +1125,9 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
             }
-            UserEvent::Tray => {}
+            UserEvent::Tray => {
+                let _ = self.cmd_tx.send(WorkerEvent::SampleAngle);
+            }
             UserEvent::Exit => {
                 event_loop.exit();
             }
