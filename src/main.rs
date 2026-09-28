@@ -6,7 +6,7 @@
 //! auto-off rule and pushes a snapshot to the winit event loop, which renders the
 //! menu-bar menu. Menu item ids are turned into commands on the worker thread.
 
-use lidup::{auto, config, displays, launch, updates};
+use lidup::{auto, config, diagnostics, displays, hdr, launch, updates};
 
 use block2::RcBlock;
 use config::Settings;
@@ -254,7 +254,9 @@ fn refresh(
     missing_since: &mut Option<Instant>,
     bound_was_present: &mut bool,
     wake_guard: &mut WakeGuard,
+    hdr_recovery: &mut hdr::HdrRecovery,
 ) -> Option<Instant> {
+    hdr_recovery.bind(settings.bound_key.as_deref());
     // auto = None means the user wants full manual control: do NOT touch the built-in
     // at all (no auto-off, no auto-restore). Otherwise the app would fight the user —
     // e.g. re-light the built-in after they closed the lid. Only in auto (bound)
@@ -287,10 +289,30 @@ fn refresh(
     if bound_present {
         *missing_since = None;
         *bound_was_present = true;
+        let external = displays_now
+            .iter()
+            .find(|d| !d.builtin && Some(d.key.as_str()) == settings.bound_key.as_deref())
+            .filter(|d| d.on && !d.asleep);
+        let builtin_may_change = !wake_guard.suppress_auto_off
+            && external.is_some()
+            && displays_now.iter().any(|d| d.builtin && d.on && !d.asleep);
+        if let Some(external) = external {
+            // Capture HDR before disabling the built-in. That configuration can
+            // also make WindowServer recreate the external in SDR mode.
+            if builtin_may_change {
+                let _ = hdr_recovery.observe(external.id, Instant::now());
+                hdr_recovery.wake(Instant::now());
+            }
+        }
         // Do not run the auto rule against a transiently missing external during
         // wake: its restore path performs a permanent display configuration.
         if !wake_guard.suppress_auto_off {
             auto::apply_auto_with_list(settings, &displays_now);
+        }
+        if let Some(external) = external {
+            if !builtin_may_change {
+                retry_at = hdr_recovery.observe(external.id, Instant::now());
+            }
         }
     } else {
         // Only an online built-in has a trustworthy sleep state. A display
@@ -434,6 +456,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
     let mut missing_since = None;
     let mut bound_was_present = false;
     let mut wake_guard = WakeGuard::default();
+    let mut hdr_recovery = hdr::HdrRecovery::default();
     let mut pending_refresh: Option<Instant> = None;
 
     // Coalesce the per-display callbacks into one settled snapshot. A single
@@ -454,12 +477,18 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                     continue;
                 }
                 WorkerEvent::PowerSleep => {
+                    diagnostics::record("power sleep");
                     wake_guard.sleep();
                     pending_refresh = None;
                     continue;
                 }
                 WorkerEvent::PowerWake => {
                     wake_guard.wake(Instant::now());
+                    hdr_recovery.wake(Instant::now());
+                    diagnostics::record(&format!(
+                        "power wake HDR restore pending={}",
+                        hdr_recovery.restore_pending()
+                    ));
                     missing_since = None;
                     pending_refresh = Some(Instant::now() + Duration::from_millis(700));
                     continue;
@@ -516,6 +545,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
             &mut missing_since,
             &mut bound_was_present,
             &mut wake_guard,
+            &mut hdr_recovery,
         );
     }
 }

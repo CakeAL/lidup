@@ -194,6 +194,9 @@ fn configure_enabled(id: DisplayID, enabled: bool) -> Result<(), String> {
 /// then the hardware set changed (e.g. right after an external was unplugged).
 fn configure_enabled_with(id: DisplayID, enabled: bool, permanent: bool) -> Result<(), String> {
     let set = set_enabled_fn().ok_or_else(|| "private display control unavailable".to_string())?;
+    crate::diagnostics::record(&format!(
+        "display configure id={id} enabled={enabled} permanent={permanent}"
+    ));
     unsafe {
         let mut config: CGDisplayConfigRef = std::ptr::null_mut();
         let begin = CGBeginDisplayConfiguration(&mut config);
@@ -212,6 +215,7 @@ fn configure_enabled_with(id: DisplayID, enabled: bool, permanent: bool) -> Resu
                 "CGCompleteDisplayConfiguration failed ({complete})"
             ));
         }
+        crate::diagnostics::record(&format!("display configured id={id} enabled={enabled}"));
         Ok(())
     }
 }
