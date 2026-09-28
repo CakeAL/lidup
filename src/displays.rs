@@ -321,17 +321,38 @@ pub fn recover_builtin() {
     recover_builtin_with_id(None);
 }
 
-/// Like [`recover_builtin`], but try the persisted built-in id before scanning.
-/// Display ids are not necessarily in the small range used by the fallback.
-pub fn recover_builtin_with_id(cached_id: Option<DisplayID>) {
-    let bid = online_displays()
+fn find_builtin_id(cached_id: Option<DisplayID>) -> Option<DisplayID> {
+    online_displays()
         .iter()
         .find(|d| d.builtin)
         .map(|d| d.id)
         .or_else(|| cached_id.filter(|&id| builtin_probe(id)))
-        .or_else(|| (1..=16u32).find(|&id| builtin_probe(id)));
+        .or_else(|| (1..=16u32).find(|&id| builtin_probe(id)))
+}
 
-    let Some(bid) = bid else {
+/// Open the built-in temporarily while the bound external is still connected.
+/// A session configuration is tried first so the monitor arrangement is not
+/// written permanently for a quick glance at the laptop display.
+pub fn show_builtin_for_angle(cached_id: Option<DisplayID>) {
+    let Some(bid) = find_builtin_id(cached_id) else {
+        return;
+    };
+    for _ in 0..3 {
+        let _ = configure_enabled_with(bid, true, false);
+        if online_displays().iter().any(|d| d.builtin && d.on) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+    // The session request can be rolled back by macOS. Use the proven unplug
+    // recovery only when the less disruptive attempts did not light the panel.
+    recover_builtin_with_id(Some(bid));
+}
+
+/// Like [`recover_builtin`], but try the persisted built-in id before scanning.
+/// Display ids are not necessarily in the small range used by the fallback.
+pub fn recover_builtin_with_id(cached_id: Option<DisplayID>) {
+    let Some(bid) = find_builtin_id(cached_id) else {
         return;
     };
 

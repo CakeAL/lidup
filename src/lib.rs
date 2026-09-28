@@ -7,4 +7,5 @@ pub mod diagnostics;
 pub mod displays;
 pub mod hdr;
 pub mod launch;
+pub mod lid_angle;
 pub mod updates;

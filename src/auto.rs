@@ -78,7 +78,10 @@ pub fn apply_auto_with_list(settings: &mut Settings, list: &[displays::DisplayIn
     let builtin_on = list.iter().find(|d| d.builtin).map_or(false, |b| b.on);
 
     if present {
-        if builtin_on && bound.is_some_and(|key| bound_ready(list, key)) {
+        if builtin_on
+            && bound.is_some_and(|key| bound_ready(list, key))
+            && !displays::is_last_active(bid)
+        {
             let _ = displays::set_enabled(bid, false);
         }
     } else if settings.restore_builtin && !builtin_on {

@@ -6,7 +6,7 @@
 //! auto-off rule and pushes a snapshot to the winit event loop, which renders the
 //! menu-bar menu. Menu item ids are turned into commands on the worker thread.
 
-use lidup::{auto, config, diagnostics, displays, hdr, launch, updates};
+use lidup::{auto, config, diagnostics, displays, hdr, launch, lid_angle, updates};
 
 use block2::RcBlock;
 use config::Settings;
@@ -31,6 +31,9 @@ use tray_icon::TrayIcon;
 struct Snapshot {
     displays: Vec<DisplayInfo>,
     bound: Option<String>,
+    open_above_angle: Option<u16>,
+    current_angle: Option<u16>,
+    angle_available: bool,
     auto_off_suppressed: bool,
     control_ok: bool,
     /// Whether launching at login is currently enabled.
@@ -46,6 +49,7 @@ enum WorkerEvent {
     Toggle(u32),
     /// User selected the external monitor to auto-off (or None).
     SetBound(Option<String>),
+    SetAngleThreshold(Option<u16>),
     /// Enable (`true`) / disable (`false`) launch-at-login. `None` = no change.
     SetLaunchAtLogin(Option<bool>),
     /// NSWorkspace reports that the Mac or its displays are sleeping/waking.
@@ -144,7 +148,12 @@ fn update_worker(
 // Worker thread (owns the settings + the actual display control)
 // ---------------------------------------------------------------------------
 
-fn snapshot(settings: &Settings, auto_off_suppressed: bool) -> Box<Snapshot> {
+fn snapshot(
+    settings: &Settings,
+    auto_off_suppressed: bool,
+    current_angle: Option<u16>,
+    angle_available: bool,
+) -> Box<Snapshot> {
     let mut list = displays::online_displays();
     // A powered-off built-in leaves the online list; re-add it so the user can
     // always toggle it back on from the menu. It must use the built-in's *stable*
@@ -178,6 +187,9 @@ fn snapshot(settings: &Settings, auto_off_suppressed: bool) -> Box<Snapshot> {
     Box::new(Snapshot {
         displays: list,
         bound: settings.bound_key.clone(),
+        open_above_angle: settings.open_above_angle,
+        current_angle,
+        angle_available,
         auto_off_suppressed,
         control_ok: displays::control_available(),
         // Use the cached flag (queried once at startup and refreshed only when the
@@ -204,6 +216,7 @@ struct WakeGuard {
     sleeping: bool,
     suppress_auto_off: bool,
     grace_until: Option<Instant>,
+    angle_switch_after: Option<Instant>,
     absent_since: Option<Instant>,
 }
 
@@ -212,6 +225,7 @@ impl WakeGuard {
         self.sleeping = true;
         self.suppress_auto_off = true;
         self.grace_until = None;
+        self.angle_switch_after = None;
         self.absent_since = None;
     }
 
@@ -219,11 +233,16 @@ impl WakeGuard {
         self.sleeping = false;
         self.suppress_auto_off = true;
         self.grace_until = Some(now + Duration::from_secs(60));
+        self.angle_switch_after = Some(now + Duration::from_secs(8));
         self.absent_since = None;
     }
 
     fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    fn angle_can_switch(&self, now: Instant) -> bool {
+        !self.sleeping && self.angle_switch_after.is_none_or(|ready| now >= ready)
     }
 
     fn observe_bound(&mut self, present: bool, now: Instant) {
@@ -255,6 +274,10 @@ fn refresh(
     bound_was_present: &mut bool,
     wake_guard: &mut WakeGuard,
     hdr_recovery: &mut hdr::HdrRecovery,
+    current_angle: Option<u16>,
+    angle_available: bool,
+    angle_intent: Option<bool>,
+    angle_last_action: &mut Option<(bool, Instant)>,
 ) -> Option<Instant> {
     hdr_recovery.bind(settings.bound_key.as_deref());
     // auto = None means the user wants full manual control: do NOT touch the built-in
@@ -265,7 +288,12 @@ fn refresh(
         *missing_since = None;
         *bound_was_present = false;
         wake_guard.reset();
-        let _ = proxy.send_event(UserEvent::Snapshot(snapshot(settings, false)));
+        let _ = proxy.send_event(UserEvent::Snapshot(snapshot(
+            settings,
+            false,
+            current_angle,
+            angle_available,
+        )));
         return None;
     }
 
@@ -293,9 +321,31 @@ fn refresh(
             .iter()
             .find(|d| !d.builtin && Some(d.key.as_str()) == settings.bound_key.as_deref())
             .filter(|d| d.on && !d.asleep);
-        let builtin_may_change = !wake_guard.suppress_auto_off
+        let builtin_on = displays_now.iter().any(|d| d.builtin && d.on);
+        let builtin_asleep = displays_now.iter().any(|d| d.builtin && d.asleep);
+        let angle_rule = settings.open_above_angle.is_some();
+        let wants_on = angle_rule
             && external.is_some()
-            && displays_now.iter().any(|d| d.builtin && d.on && !d.asleep);
+            && current_angle.is_some()
+            && angle_intent == Some(true)
+            && wake_guard.angle_can_switch(Instant::now());
+        let wants_off = if angle_rule {
+            current_angle.is_some()
+                && angle_intent == Some(false)
+                && wake_guard.angle_can_switch(Instant::now())
+                && !hdr_recovery.restore_pending()
+        } else {
+            !wake_guard.suppress_auto_off
+        };
+        let angle_action_allowed = !angle_rule
+            || angle_last_action.is_none_or(|(desired, when)| {
+                let target = wants_on;
+                desired != target || Instant::now().duration_since(when) >= Duration::from_secs(10)
+            });
+        let builtin_may_change = angle_action_allowed
+            && external.is_some()
+            && !builtin_asleep
+            && ((wants_on && !builtin_on) || (wants_off && builtin_on));
         if let Some(external) = external {
             // Capture HDR before disabling the built-in. That configuration can
             // also make WindowServer recreate the external in SDR mode.
@@ -304,9 +354,15 @@ fn refresh(
                 hdr_recovery.wake(Instant::now());
             }
         }
-        // Do not run the auto rule against a transiently missing external during
-        // wake: its restore path performs a permanent display configuration.
-        if !wake_guard.suppress_auto_off {
+        // Leave the display set alone while the angle reading is unavailable or
+        // still being debounced. A cable pull is handled by the branch below.
+        if wants_on && !builtin_on && !builtin_asleep && angle_action_allowed {
+            *angle_last_action = Some((true, Instant::now()));
+            displays::show_builtin_for_angle(settings.builtin_id);
+        } else if wants_off && angle_action_allowed {
+            if angle_rule && builtin_on && !builtin_asleep {
+                *angle_last_action = Some((false, Instant::now()));
+            }
             auto::apply_auto_with_list(settings, &displays_now);
         }
         if let Some(external) = external {
@@ -355,6 +411,8 @@ fn refresh(
     let _ = proxy.send_event(UserEvent::Snapshot(snapshot(
         settings,
         wake_guard.suppress_auto_off,
+        current_angle,
+        angle_available,
     )));
     // A cable pull does not always emit a CoreGraphics callback. Check again
     // while auto mode is active so an unplug cannot leave the built-in dark.
@@ -422,6 +480,16 @@ mod worker_tests {
     }
 
     #[test]
+    fn angle_switch_waits_until_wake_display_configuration_settles() {
+        let now = Instant::now();
+        let mut guard = WakeGuard::default();
+        guard.wake(now);
+        assert!(!guard.angle_can_switch(now + Duration::from_secs(7)));
+        assert!(guard.angle_can_switch(now + Duration::from_secs(8)));
+        assert!(guard.suppress_auto_off);
+    }
+
+    #[test]
     fn workspace_power_notifications_reach_worker() {
         let (tx, rx) = mpsc::channel();
         let _observers = observe_power_events(tx);
@@ -457,96 +525,162 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
     let mut bound_was_present = false;
     let mut wake_guard = WakeGuard::default();
     let mut hdr_recovery = hdr::HdrRecovery::default();
-    let mut pending_refresh: Option<Instant> = None;
+    let mut pending_refresh = Some(Instant::now());
+    let mut angle_reader = lid_angle::Reader::default();
+    let mut angle_gate = lid_angle::Gate::default();
+    angle_gate.configure(settings.open_above_angle);
+    let mut current_angle = None;
+    let mut next_angle_poll = Some(Instant::now());
+    let mut last_angle_snapshot = Instant::now() - Duration::from_secs(2);
+    let mut angle_last_action = None;
 
     // Coalesce the per-display callbacks into one settled snapshot. A single
     // reconfiguration sends multiple callbacks, particularly during sleep/wake.
     loop {
-        let event = if let Some(deadline) = pending_refresh {
+        let deadline = match (pending_refresh, next_angle_poll) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        let event = if let Some(deadline) = deadline {
             rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
         } else {
             rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
         };
         match event {
-            Ok(ev) => match ev {
-                WorkerEvent::DisplayChanged => {
-                    // Start the absence confirmation after the latest completed
-                    // reconfiguration, including one delivered on system wake.
-                    missing_since = None;
-                    pending_refresh = Some(Instant::now() + Duration::from_millis(700));
-                    continue;
-                }
-                WorkerEvent::PowerSleep => {
-                    diagnostics::record("power sleep");
-                    wake_guard.sleep();
-                    pending_refresh = None;
-                    continue;
-                }
-                WorkerEvent::PowerWake => {
-                    wake_guard.wake(Instant::now());
-                    hdr_recovery.wake(Instant::now());
-                    diagnostics::record(&format!(
-                        "power wake HDR restore pending={}",
-                        hdr_recovery.restore_pending()
-                    ));
-                    missing_since = None;
-                    pending_refresh = Some(Instant::now() + Duration::from_millis(700));
-                    continue;
-                }
-                WorkerEvent::Toggle(id) => {
-                    // A manual toggle is an explicit user override: disable the
-                    // auto-off rule so it doesn't immediately fight the change.
-                    if settings.bound_key.is_some() {
-                        settings.bound_key = None;
-                        let _ = settings.save();
+            Ok(ev) => {
+                match ev {
+                    WorkerEvent::DisplayChanged => {
+                        // Start the absence confirmation after the latest completed
+                        // reconfiguration, including one delivered on system wake.
+                        missing_since = None;
+                        pending_refresh = Some(Instant::now() + Duration::from_millis(700));
+                        continue;
                     }
-                    let _ = displays::toggle_safe(id);
-                }
-                WorkerEvent::SetBound(key) => {
-                    wake_guard.reset();
-                    let going_to_manual = key.is_none();
-                    settings.bound_key = key;
-                    let _ = settings.save();
-                    // Switching to manual (None) ends the auto-off: if the built-in
-                    // was disabled by the auto rule, bring it back on now. Otherwise
-                    // it would stay off (a fully-disabled built-in doesn't even
-                    // recover on lid open, since it's software-disabled, not asleep).
-                    if going_to_manual {
-                        displays::recover_builtin_with_id(settings.builtin_id);
+                    WorkerEvent::PowerSleep => {
+                        diagnostics::record("power sleep");
+                        wake_guard.sleep();
+                        angle_reader.reset();
+                        current_angle = None;
+                        next_angle_poll = None;
+                        pending_refresh = None;
+                        continue;
                     }
-                }
-                WorkerEvent::SetLaunchAtLogin(enabled) => {
-                    if let Some(enabled) = enabled {
-                        let result = if enabled {
-                            launch::register()
-                        } else {
-                            launch::unregister()
-                        };
-                        if result.is_ok() {
-                            settings.launch_at_login = enabled;
+                    WorkerEvent::PowerWake => {
+                        wake_guard.wake(Instant::now());
+                        hdr_recovery.wake(Instant::now());
+                        angle_reader.reset();
+                        angle_gate.reset();
+                        current_angle = None;
+                        angle_last_action = None;
+                        next_angle_poll = Some(Instant::now() + Duration::from_secs(1));
+                        diagnostics::record(&format!(
+                            "power wake HDR restore pending={}",
+                            hdr_recovery.restore_pending()
+                        ));
+                        missing_since = None;
+                        pending_refresh = Some(Instant::now() + Duration::from_millis(700));
+                        continue;
+                    }
+                    WorkerEvent::Toggle(id) => {
+                        // A manual toggle is an explicit user override: disable the
+                        // auto-off rule so it doesn't immediately fight the change.
+                        if settings.bound_key.is_some() {
+                            settings.bound_key = None;
                             let _ = settings.save();
                         }
+                        let _ = displays::toggle_safe(id);
+                    }
+                    WorkerEvent::SetBound(key) => {
+                        wake_guard.reset();
+                        angle_gate.reset();
+                        angle_last_action = None;
+                        let going_to_manual = key.is_none();
+                        settings.bound_key = key;
+                        let _ = settings.save();
+                        // Switching to manual (None) ends the auto-off: if the built-in
+                        // was disabled by the auto rule, bring it back on now. Otherwise
+                        // it would stay off (a fully-disabled built-in doesn't even
+                        // recover on lid open, since it's software-disabled, not asleep).
+                        if going_to_manual {
+                            displays::recover_builtin_with_id(settings.builtin_id);
+                        }
+                    }
+                    WorkerEvent::SetAngleThreshold(threshold) => {
+                        settings.open_above_angle = threshold;
+                        let _ = settings.save();
+                        angle_gate.configure(threshold);
+                        angle_last_action = None;
+                        next_angle_poll = Some(Instant::now());
+                    }
+                    WorkerEvent::SetLaunchAtLogin(enabled) => {
+                        if let Some(enabled) = enabled {
+                            let result = if enabled {
+                                launch::register()
+                            } else {
+                                launch::unregister()
+                            };
+                            if result.is_ok() {
+                                settings.launch_at_login = enabled;
+                                let _ = settings.save();
+                            }
+                        }
+                    }
+                    WorkerEvent::Quit => {
+                        // Restore the built-in display so the user isn't left dark.
+                        displays::recover_builtin_with_id(settings.builtin_id);
+                        let _ = proxy.send_event(UserEvent::Exit);
+                        return;
                     }
                 }
-                WorkerEvent::Quit => {
-                    // Restore the built-in display so the user isn't left dark.
-                    displays::recover_builtin_with_id(settings.builtin_id);
-                    let _ = proxy.send_event(UserEvent::Exit);
-                    return;
-                }
-            },
+                pending_refresh = Some(Instant::now());
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => return,
         }
 
-        pending_refresh = refresh(
-            &proxy,
-            &mut settings,
-            &mut missing_since,
-            &mut bound_was_present,
-            &mut wake_guard,
-            &mut hdr_recovery,
-        );
+        let now = Instant::now();
+        if next_angle_poll.is_some_and(|due| now >= due) {
+            let previous_angle = current_angle;
+            let previous_available = angle_reader.available();
+            current_angle = angle_reader.sample(now);
+            angle_gate.configure(settings.open_above_angle);
+            let crossed = angle_gate.observe(current_angle, now);
+            let interval = if settings.bound_key.is_some() && settings.open_above_angle.is_some() {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_secs(2)
+            };
+            next_angle_poll = Some(now + interval);
+            if crossed
+                || angle_reader.available() != previous_available
+                || (current_angle != previous_angle
+                    && now.duration_since(last_angle_snapshot) >= Duration::from_secs(1))
+            {
+                // A display callback deliberately waits 700 ms for the hardware
+                // topology to settle. A sensor reading must not bypass that wait.
+                if pending_refresh.is_none_or(|due| {
+                    due.saturating_duration_since(now) > Duration::from_millis(700)
+                }) {
+                    pending_refresh = Some(now);
+                }
+                last_angle_snapshot = now;
+            }
+        }
+        if pending_refresh.is_some_and(|due| Instant::now() >= due) {
+            pending_refresh = refresh(
+                &proxy,
+                &mut settings,
+                &mut missing_since,
+                &mut bound_was_present,
+                &mut wake_guard,
+                &mut hdr_recovery,
+                current_angle,
+                angle_reader.available(),
+                angle_gate.open(),
+                &mut angle_last_action,
+            );
+        }
     }
 }
 
@@ -572,7 +706,10 @@ fn toggle_label(d: &DisplayInfo) -> String {
 }
 
 fn auto_summary(snap: &Snapshot) -> String {
-    if snap.auto_off_suppressed && snap.displays.iter().any(|d| d.builtin && d.on) {
+    if snap.auto_off_suppressed
+        && snap.open_above_angle.is_none()
+        && snap.displays.iter().any(|d| d.builtin && d.on)
+    {
         return "自动关闭内建屏：唤醒后暂停（保护 HDR）".into();
     }
     match snap.bound.as_deref() {
@@ -581,6 +718,17 @@ fn auto_summary(snap: &Snapshot) -> String {
             Some(display) => format!("自动关闭内建屏：{}", display.name),
             None => "自动关闭内建屏：等待已绑定显示器".into(),
         },
+    }
+}
+
+fn angle_summary(snap: &Snapshot) -> String {
+    if !snap.angle_available {
+        return "开合角传感器不可用".into();
+    }
+    match (snap.current_angle, snap.open_above_angle) {
+        (Some(angle), Some(limit)) => format!("当前 {angle}° · 大于 {limit}° 点亮内建屏"),
+        (Some(angle), None) => format!("当前开合角：{angle}°"),
+        (None, _) => "正在读取开合角…".into(),
     }
 }
 
@@ -598,6 +746,9 @@ struct MenuState {
     auto_summary: MenuItem,
     bind_none: CheckMenuItem,
     bind_items: Vec<(String, CheckMenuItem)>,
+    angle_status: MenuItem,
+    angle_none: CheckMenuItem,
+    angle_items: Vec<(u16, CheckMenuItem)>,
     toggle_items: Vec<(u32, CheckMenuItem)>,
     start_login: CheckMenuItem,
     check_update: MenuItem,
@@ -660,6 +811,35 @@ impl MenuState {
             bind_items.push((d.key.clone(), item));
         }
         let _ = menu.append(&bind);
+        let angle = Submenu::new("开合角控制", true);
+        let angle_status = MenuItem::with_id("angle-status", angle_summary(snap), false, None);
+        let _ = angle.append(&angle_status);
+        let _ = angle.append(&PredefinedMenuItem::separator());
+        let angle_none = CheckMenuItem::with_id(
+            "angle:none",
+            "关闭角度控制",
+            true,
+            snap.open_above_angle.is_none(),
+            None,
+        );
+        let _ = angle.append(&angle_none);
+        let mut angle_items = Vec::new();
+        for (label, low, high) in [("45°–90°", 45, 90), ("95°–135°", 95, 135)] {
+            let group = Submenu::new(label, true);
+            for threshold in (low..=high).step_by(5) {
+                let item = CheckMenuItem::with_id(
+                    format!("angle:{threshold}"),
+                    format!("大于 {threshold}° 时点亮"),
+                    snap.angle_available,
+                    snap.open_above_angle == Some(threshold),
+                    None,
+                );
+                let _ = group.append(&item);
+                angle_items.push((threshold, item));
+            }
+            let _ = angle.append(&group);
+        }
+        let _ = menu.append(&angle);
         let start_login = CheckMenuItem::with_id(
             "start-login",
             "登录时启动",
@@ -698,6 +878,9 @@ impl MenuState {
             auto_summary,
             bind_none,
             bind_items,
+            angle_status,
+            angle_none,
+            angle_items,
             toggle_items,
             start_login,
             check_update,
@@ -720,6 +903,12 @@ impl MenuState {
         self.bind_none.set_checked(snap.bound.is_none());
         for (key, item) in &self.bind_items {
             item.set_checked(snap.bound.as_deref() == Some(key.as_str()));
+        }
+        self.angle_status.set_text(angle_summary(snap));
+        self.angle_none.set_checked(snap.open_above_angle.is_none());
+        for (threshold, item) in &self.angle_items {
+            item.set_checked(snap.open_above_angle == Some(*threshold));
+            item.set_enabled(snap.angle_available);
         }
         for (id, item) in &self.toggle_items {
             if let Some(d) = snap.displays.iter().find(|d| d.id == *id) {
@@ -777,7 +966,7 @@ impl ApplicationHandler<UserEvent> for App {
             // so the first worker-sent snapshot matches and we never rebuild the
             // tray menu right after startup.
             let settings = Settings::load();
-            let snap = *snapshot(&settings, false);
+            let snap = *snapshot(&settings, false, None, false);
             let ms = MenuState::build(&snap, &self.update_status);
             let icon = tray_image();
             match TrayIconBuilderCompat::build(icon, ms.menu.clone()) {
@@ -901,6 +1090,15 @@ impl ApplicationHandler<UserEvent> for App {
                         Some(key.to_string())
                     };
                     let _ = self.cmd_tx.send(WorkerEvent::SetBound(key));
+                } else if let Some(value) = id.as_ref().strip_prefix("angle:") {
+                    let threshold = if value == "none" {
+                        Some(None)
+                    } else {
+                        value.parse::<u16>().ok().map(Some)
+                    };
+                    if let Some(threshold) = threshold {
+                        let _ = self.cmd_tx.send(WorkerEvent::SetAngleThreshold(threshold));
+                    }
                 } else if let Some(sid) = id.as_ref().strip_prefix("toggle:") {
                     if let Ok(did) = sid.parse::<u32>() {
                         let _ = self.cmd_tx.send(WorkerEvent::Toggle(did));

@@ -17,6 +17,10 @@ pub struct Settings {
     /// Stable identity key of the built-in display, used to keep its menu entry
     /// stable (same key whether it is on or off) so the tray menu isn't rebuilt.
     pub builtin_key: Option<String>,
+    /// When auto mode is active, light the built-in above this hinge angle.
+    /// `None` keeps the original external-monitor-only auto rule.
+    #[serde(default)]
+    pub open_above_angle: Option<u16>,
     /// True if lidup is set to launch at login (a LaunchAgent is installed).
     pub launch_at_login: bool,
 }
@@ -28,6 +32,7 @@ impl Default for Settings {
             restore_builtin: true,
             builtin_id: None,
             builtin_key: None,
+            open_above_angle: None,
             launch_at_login: false,
         }
     }
@@ -63,5 +68,17 @@ impl Settings {
         let s = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
         std::fs::write(&path, s).map_err(|e| e.to_string())?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Settings;
+
+    #[test]
+    fn existing_settings_keep_angle_control_disabled() {
+        let old = r#"{"bound_key":"external","restore_builtin":true,"builtin_id":1,"builtin_key":"built-in","launch_at_login":true}"#;
+        let settings: Settings = serde_json::from_str(old).unwrap();
+        assert_eq!(settings.open_above_angle, None);
     }
 }

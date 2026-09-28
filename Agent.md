@@ -8,6 +8,7 @@ lidup 是 macOS 菜单栏程序。用户选定一台外接显示器后，程序�
 
 - `src/main.rs`：菜单、事件循环、后台 worker 和自动规则的调度。
 - `src/displays.rs`：CoreGraphics 显示器枚举和重配置回调；通过运行时加载的私有 SkyLight `CGSConfigureDisplayEnabled` 开关显示器。
+- `src/lid_angle.rs`：通过 IOKit HID 读取 MacBook 开合角，并对阈值切换进行防抖。
 - `src/hdr.rs`：读取绑定外接屏的 HDR 偏好，并在唤醒后按睡前状态恢复；通过运行时加载私有 MonitorPanel 框架实现。
 - `src/diagnostics.rs`：记录关键电源事件与显示器配置调用到 `~/Library/Logs/lidup.log`，便于与 WindowServer 日志对照。
 - `src/auto.rs`：选定外接屏与内建屏之间的自动规则及其单元测试。
@@ -23,6 +24,7 @@ lidup 是 macOS 菜单栏程序。用户选定一台外接显示器后，程序�
 - 通过 `NSWorkspace` 的整机和屏幕睡眠/唤醒通知暂停唤醒后的自动关屏；唤醒后 CoreGraphics 可能暂时把内建屏报告为已开启，不得因此再次调用 `CGSConfigureDisplayEnabled`。绑定外接屏确实持续缺席超过唤醒保护期后才能重新启用自动关屏；断线恢复内建屏仍按五秒确认执行。
 - WindowServer 也可能在 lidup 没有调用显示配置 API 时将唤醒后的外接屏重建为 SDR。只对睡前明确开启 HDR 的绑定外接屏执行延迟恢复；避免覆盖用户持续关闭 HDR 的选择。MonitorPanel 私有接口不可用时跳过 HDR 恢复，不影响内建屏插拔逻辑。
 - 自动模式只管理内建屏；手动切换显示器后关闭自动模式。关屏操作必须保留至少一块可用显示器。关闭程序时恢复内建屏。
+- 角度阈值仅在绑定外接屏在线且可用时生效；高于阈值点亮内建屏，低于阈值关闭内建屏。传感器读数缺失时保持当前状态，拔线恢复仍独立执行。睡眠期间不读传感器，唤醒后等待显示配置稳定。角度切换前保留外接屏 HDR 状态。
 - 被软件关闭的内建屏可能不在 `CGGetOnlineDisplayList` 结果中；使用配置中缓存的显示器 ID 恢复。恢复操作会调用私有 API，应避免无条件或重复执行。
 - 更新检查和安装必须在独立线程执行，不能阻塞菜单事件循环或显示器 worker。GitHub 请求有超时；网络或安装失败只影响更新状态。`self_update` 安装整个 `lidup.app`，从 Release 中选择 `lidup.zip` 并验证解压后的应用签名；更新完成后从菜单重启。应用版本来自 `CARGO_PKG_VERSION`；`pack.sh` 从 `Cargo.toml` 读取包版本写入 `Info.plist`。
 - 对纯决策逻辑运行 `cargo test`，并用 `cargo fmt --check` 检查格式。实际睡眠唤醒验证会操作本机显示器，不应当作普通自动测试运行。
