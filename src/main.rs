@@ -55,7 +55,9 @@ enum WorkerEvent {
     SetLaunchAtLogin(Option<bool>),
     /// NSWorkspace reports that the Mac or its displays are sleeping/waking.
     PowerSleep,
-    PowerWake,
+    PowerWake {
+        screens_ready: bool,
+    },
     Quit,
 }
 
@@ -425,7 +427,8 @@ fn refresh(
 mod worker_tests {
     use super::{needs_builtin_restore, observe_power_events, WakeGuard, WorkerEvent};
     use objc2_app_kit::{
-        NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceWillSleepNotification,
+        NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceScreensDidWakeNotification,
+        NSWorkspaceWillSleepNotification,
     };
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
@@ -507,7 +510,18 @@ mod worker_tests {
         }
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            WorkerEvent::PowerWake
+            WorkerEvent::PowerWake {
+                screens_ready: false
+            }
+        ));
+        unsafe {
+            center.postNotificationName_object(NSWorkspaceScreensDidWakeNotification, None);
+        }
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WorkerEvent::PowerWake {
+                screens_ready: true
+            }
         ));
     }
 }
@@ -579,20 +593,32 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         pending_refresh = None;
                         continue;
                     }
-                    WorkerEvent::PowerWake => {
-                        wake_guard.wake(Instant::now());
-                        hdr_recovery.wake(Instant::now());
-                        angle_reader.reset();
-                        angle_gate.reset();
-                        current_angle = None;
-                        angle_last_action = None;
-                        next_angle_poll = Some(Instant::now() + Duration::from_secs(1));
+                    WorkerEvent::PowerWake { screens_ready } => {
+                        let now = Instant::now();
+                        if wake_guard.sleeping || wake_guard.grace_until.is_none() {
+                            wake_guard.wake(now);
+                            angle_reader.reset();
+                            angle_gate.reset();
+                            current_angle = None;
+                            angle_last_action = None;
+                            next_angle_poll = Some(now + Duration::from_secs(1));
+                        }
+                        hdr_recovery.wake(now);
+                        if screens_ready {
+                            hdr_recovery.screens_woke(now);
+                        }
                         diagnostics::record(&format!(
-                            "power wake HDR restore pending={}",
+                            "power wake screens_ready={screens_ready} HDR restore pending={}",
                             hdr_recovery.restore_pending()
                         ));
                         missing_since = None;
-                        pending_refresh = Some(Instant::now() + Duration::from_millis(700));
+                        pending_refresh = Some(
+                            now + if screens_ready {
+                                Duration::from_millis(200)
+                            } else {
+                                Duration::from_millis(700)
+                            },
+                        );
                         continue;
                     }
                     WorkerEvent::Toggle(id) => {
@@ -1214,21 +1240,21 @@ fn observe_power_events(tx: mpsc::Sender<WorkerEvent>) -> PowerObservers {
     let center = NSWorkspace::sharedWorkspace().notificationCenter();
     let notifications = unsafe {
         [
-            (NSWorkspaceWillSleepNotification, true),
-            (NSWorkspaceScreensDidSleepNotification, true),
-            (NSWorkspaceDidWakeNotification, false),
-            (NSWorkspaceScreensDidWakeNotification, false),
+            (NSWorkspaceWillSleepNotification, true, false),
+            (NSWorkspaceScreensDidSleepNotification, true, false),
+            (NSWorkspaceDidWakeNotification, false, false),
+            (NSWorkspaceScreensDidWakeNotification, false, true),
         ]
     };
     let tokens = notifications
         .into_iter()
-        .map(|(name, sleeping)| {
+        .map(|(name, sleeping, screens_ready)| {
             let tx = tx.clone();
             let block = RcBlock::new(move |_notification: std::ptr::NonNull<NSNotification>| {
                 let event = if sleeping {
                     WorkerEvent::PowerSleep
                 } else {
-                    WorkerEvent::PowerWake
+                    WorkerEvent::PowerWake { screens_ready }
                 };
                 let _ = tx.send(event);
             });

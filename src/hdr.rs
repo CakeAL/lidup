@@ -166,7 +166,7 @@ pub struct HdrRecovery {
     bound_key: Option<String>,
     last_enabled: bool,
     off_since: Option<Instant>,
-    last_check: Option<Instant>,
+    observe_requested: bool,
     pending: bool,
     ready_at: Option<Instant>,
     expires_at: Option<Instant>,
@@ -182,14 +182,14 @@ impl HdrRecovery {
         if self.bound_key.as_deref() != key {
             *self = Self {
                 bound_key: key.map(str::to_owned),
+                observe_requested: key.is_some(),
                 ..Self::default()
             };
         }
     }
 
     pub fn wake(&mut self, now: Instant) {
-        self.last_check = None;
-        if self.last_enabled {
+        if self.last_enabled && !self.pending {
             self.pending = true;
             self.ready_at = Some(now + Duration::from_secs(3));
             self.expires_at = Some(now + Duration::from_secs(45));
@@ -197,33 +197,51 @@ impl HdrRecovery {
         }
     }
 
-    /// Called only for an active, awake bound monitor. Returns the next time a
-    /// pending restore should be checked; normal HDR state is sampled otherwise.
+    /// Screen-wake notification arrives after the first WindowServer mode
+    /// negotiation. Check shortly afterward, while the monitor may still be
+    /// blank, instead of waiting for the generic three-second fallback.
+    pub fn screens_woke(&mut self, now: Instant) {
+        if self.pending && self.attempts == 0 {
+            self.ready_at = Some(now + Duration::from_millis(200));
+        }
+    }
+
+    /// Called only for an active, awake bound monitor. Stable state needs no
+    /// background reads; events and a pending recovery request the next read.
     pub fn observe(&mut self, id: u32, now: Instant) -> Option<Instant> {
-        // Constructing MPDisplayMgr enumerates every mode on every monitor.
-        // A two-second display watchdog must not rebuild it every time.
-        if !self.background_sample_due(now) {
+        self.observe_requested_with(id, now, state, enable)
+    }
+
+    fn observe_requested_with(
+        &mut self,
+        id: u32,
+        now: Instant,
+        read: impl Fn(u32) -> Option<HdrState>,
+        restore: impl Fn(u32) -> bool,
+    ) -> Option<Instant> {
+        if !self.pending && !self.observe_requested {
             return None;
         }
-        self.observe_now(id, now)
-    }
-
-    fn background_sample_due(&self, now: Instant) -> bool {
-        self.pending
-            || self
-                .last_check
-                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(30))
-    }
-
-    /// Read immediately before changing the display set, even if the normal
-    /// background sample was recent.
-    pub fn observe_now(&mut self, id: u32, now: Instant) -> Option<Instant> {
-        self.last_check = Some(now);
-        self.observe_with(id, now, state, enable)
+        if !self.pending {
+            if let Some(deadline) = self.off_since.map(|since| since + Duration::from_secs(5)) {
+                if now < deadline {
+                    return Some(deadline);
+                }
+            }
+        }
+        let retry = self.observe_with(id, now, read, restore);
+        if !self.pending {
+            self.observe_requested = self.off_since.is_some();
+            return self
+                .off_since
+                .map(|since| since + Duration::from_secs(5))
+                .or(retry);
+        }
+        retry
     }
 
     pub fn request_observation(&mut self) {
-        self.last_check = None;
+        self.observe_requested = true;
     }
 
     /// A live reading before sleep or a display change takes precedence over an
@@ -236,7 +254,11 @@ impl HdrRecovery {
         if let Some(current) = state(id).filter(|state| state.supported) {
             self.last_enabled = current.enabled;
             self.off_since = None;
-            self.last_check = Some(Instant::now());
+            self.observe_requested = false;
+            crate::diagnostics::record(&format!(
+                "HDR preference captured id={id} enabled={}",
+                current.enabled
+            ));
         }
     }
 
@@ -259,14 +281,16 @@ impl HdrRecovery {
                     } else {
                         // A display may briefly report SDR as it goes to sleep.
                         // Treat a sustained change as the user's HDR preference.
-                        let since = *self.off_since.get_or_insert(now);
-                        if now.duration_since(since) >= Duration::from_secs(5) {
-                            if self.last_enabled {
-                                crate::diagnostics::record(&format!(
-                                    "HDR observed disabled id={id}"
-                                ));
-                            }
+                        if !self.last_enabled {
+                            self.off_since = None;
+                        } else if self.off_since.is_some_and(|since| {
+                            now.duration_since(since) >= Duration::from_secs(5)
+                        }) {
+                            crate::diagnostics::record(&format!("HDR observed disabled id={id}"));
                             self.last_enabled = false;
+                            self.off_since = None;
+                        } else {
+                            self.off_since.get_or_insert(now);
                         }
                     }
                 }
@@ -295,7 +319,9 @@ impl HdrRecovery {
             Some(HdrState {
                 supported: true,
                 enabled: false,
-            }) if restore(id) => {
+            }) => {
+                crate::diagnostics::record(&format!("HDR wake observed SDR id={id}"));
+                let _ = restore(id);
                 self.attempts += 1;
                 let next = now + Duration::from_secs(2);
                 self.ready_at = Some(next);
@@ -368,6 +394,20 @@ mod tests {
     }
 
     #[test]
+    fn screen_wake_advances_recovery_without_rearming_on_duplicate_wake() {
+        let now = Instant::now();
+        let mut recovery = HdrRecovery::default();
+        recovery.bind(Some("monitor-a"));
+        recovery.last_enabled = true;
+        recovery.wake(now);
+        recovery.screens_woke(now + Duration::from_secs(1));
+        let ready = now + Duration::from_millis(1200);
+        assert_eq!(recovery.ready_at, Some(ready));
+        recovery.wake(now + Duration::from_secs(2));
+        assert_eq!(recovery.ready_at, Some(ready));
+    }
+
+    #[test]
     fn sustained_manual_hdr_off_is_respected_on_next_wake() {
         let now = Instant::now();
         let mut recovery = HdrRecovery::default();
@@ -390,18 +430,68 @@ mod tests {
     }
 
     #[test]
-    fn background_hdr_reads_are_sparse_but_wake_is_immediate() {
+    fn stable_hdr_is_read_only_on_events_and_off_is_confirmed_once() {
         let now = Instant::now();
         let mut recovery = HdrRecovery::default();
-        assert!(recovery.background_sample_due(now));
-        recovery.last_check = Some(now);
-        assert!(!recovery.background_sample_due(now + Duration::from_secs(29)));
-        assert!(recovery.background_sample_due(now + Duration::from_secs(30)));
+        recovery.bind(Some("monitor-a"));
+        let reads = Cell::new(0);
+        let on = |_| {
+            reads.set(reads.get() + 1);
+            Some(HDR_ON)
+        };
+        assert_eq!(
+            recovery.observe_requested_with(2, now, on, |_| unreachable!()),
+            None
+        );
+        assert_eq!(reads.get(), 1);
+        assert_eq!(
+            recovery.observe_requested_with(
+                2,
+                now + Duration::from_secs(30),
+                on,
+                |_| unreachable!()
+            ),
+            None
+        );
+        assert_eq!(reads.get(), 1);
+
         recovery.request_observation();
-        assert!(recovery.background_sample_due(now + Duration::from_secs(1)));
-        recovery.last_enabled = true;
-        recovery.wake(now + Duration::from_secs(1));
-        assert!(recovery.background_sample_due(now + Duration::from_secs(1)));
+        let off = |_| {
+            reads.set(reads.get() + 1);
+            Some(HDR_OFF)
+        };
+        assert_eq!(
+            recovery.observe_requested_with(
+                2,
+                now + Duration::from_secs(31),
+                off,
+                |_| unreachable!()
+            ),
+            Some(now + Duration::from_secs(36))
+        );
+        assert_eq!(reads.get(), 2);
+        assert_eq!(
+            recovery.observe_requested_with(
+                2,
+                now + Duration::from_secs(33),
+                off,
+                |_| unreachable!()
+            ),
+            Some(now + Duration::from_secs(36))
+        );
+        assert_eq!(reads.get(), 2);
+        assert_eq!(
+            recovery.observe_requested_with(
+                2,
+                now + Duration::from_secs(36),
+                off,
+                |_| unreachable!()
+            ),
+            None
+        );
+        assert_eq!(reads.get(), 3);
+        recovery.wake(now + Duration::from_secs(37));
+        assert!(!recovery.restore_pending());
     }
 
     #[test]
