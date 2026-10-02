@@ -12,6 +12,7 @@ APP_VERSION=$(awk -F '"' '/^version = / { print $2; exit }' Cargo.toml)
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp "$BIN" "$APP/Contents/MacOS/lidup"
+cp "assets/app-icon.icns" "$APP/Contents/Resources/lidup.icns"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -25,6 +26,7 @@ cat > "$APP/Contents/Info.plist" <<PLIST
     <key>CFBundleShortVersionString</key><string>$APP_VERSION</string>
     <key>CFBundlePackageType</key><string>APPL</string>
     <key>CFBundleExecutable</key><string>lidup</string>
+    <key>CFBundleIconFile</key><string>lidup.icns</string>
     <key>LSMinimumSystemVersion</key><string>12.0</string>
     <key>NSHighResolutionCapable</key><true/>
     <key>LSUIElement</key><true/>

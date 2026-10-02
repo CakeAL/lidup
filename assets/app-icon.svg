@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <title>lidup app icon</title>
+  <defs>
+    <linearGradient id="background" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#244760"/>
+      <stop offset="0.55" stop-color="#102B42"/>
+      <stop offset="1" stop-color="#081B2B"/>
+    </linearGradient>
+    <radialGradient id="light" cx="62%" cy="29%" r="68%">
+      <stop offset="0" stop-color="#51C4DF" stop-opacity="0.3"/>
+      <stop offset="1" stop-color="#51C4DF" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="frame" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#A9DBEC"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#214F69"/>
+      <stop offset="1" stop-color="#0E314B"/>
+    </linearGradient>
+    <linearGradient id="base" x1="180" y1="775" x2="844" y2="775"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#B9E3EF"/>
+      <stop offset="0.5" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#8CD7E8"/>
+    </linearGradient>
+    <filter id="shadow" x="-30%" y="-30%" width="160%" height="160%">
+      <feGaussianBlur stdDeviation="20"/>
+    </filter>
+  </defs>
+
+  <rect width="1024" height="1024" fill="url(#background)"/>
+  <rect width="1024" height="1024" fill="url(#light)"/>
+
+  <!-- A 60-degree lid: the screen rises 450 units and shifts 260 units. -->
+  <path d="M470 230H800L540 680H210Z" fill="#00111F" opacity="0.42"
+        transform="translate(10 18)" filter="url(#shadow)"/>
+  <path d="M470 230H800L540 680H210Z" fill="url(#frame)" stroke="url(#frame)"
+        stroke-width="24" stroke-linejoin="round"/>
+  <path d="M488 285H718L522 625H292Z" fill="url(#screen)" stroke="url(#screen)"
+        stroke-width="10" stroke-linejoin="round"/>
+
+  <path d="M180 775H844" stroke="#00111F" stroke-opacity="0.35"
+        stroke-width="76" stroke-linecap="round" transform="translate(0 17)"
+        filter="url(#shadow)"/>
+  <path d="M180 775H844" stroke="url(#base)" stroke-width="52" stroke-linecap="round"/>
+</svg>

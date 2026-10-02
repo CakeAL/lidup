@@ -15,7 +15,8 @@ lidup 是 macOS 菜单栏程序。用户选定一台外接显示器后，程序�
 - `src/config.rs`：配置的 JSON 读写。默认位置为 `~/Library/Application Support/lidup/config.json`，可用 `LIDUP_CONFIG` 覆盖。
 - `src/launch.rs`：通过 `SMAppService` 管理登录自启。
 - `src/updates.rs`：使用 `self_update` 检查 GitHub 最新正式 Release、下载并替换当前 `.app`。
-- `pack.sh`：构建、签名并打包菜单栏 `.app`；`.github/workflows/build.yml` 在发布标签上运行打包。
+- `assets/app-icon.svg`：应用图标的矢量源文件；`assets/app-icon.icns` 是预生成的 macOS 图标资源。
+- `pack.sh`：构建、签名并打包菜单栏 `.app`，包括应用图标；`.github/workflows/build.yml` 在发布标签上运行打包。
 
 ## 开发约束
 
@@ -32,3 +33,4 @@ lidup 是 macOS 菜单栏程序。用户选定一台外接显示器后，程序�
 - 更新检查和安装必须在独立线程执行，不能阻塞菜单事件循环或显示器 worker。GitHub 请求有超时；网络或安装失败只影响更新状态。`self_update` 安装整个 `lidup.app`，从 Release 中选择 `lidup.zip` 并验证解压后的应用签名；更新完成后从菜单重启。应用版本来自 `CARGO_PKG_VERSION`；`pack.sh` 从 `Cargo.toml` 读取包版本写入 `Info.plist`。
 - 对纯决策逻辑运行 `cargo test`，并用 `cargo fmt --check` 检查格式。实际睡眠唤醒验证会操作本机显示器，不应当作普通自动测试运行。
 - 修改应用入口或系统 API 后，在 macOS 上运行 `cargo build`；打包使用 `./pack.sh`。裸二进制不能可靠注册登录项，测试菜单程序应运行 `.app`。
+- 修改应用图标后运行 `./assets/make-icon.sh`，提交 SVG 源文件和生成的 ICNS；发布构建直接复制已提交的 ICNS，不依赖 CI 安装绘图工具。
