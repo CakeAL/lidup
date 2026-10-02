@@ -1185,34 +1185,46 @@ impl TrayIconBuilderCompat {
     }
 }
 
-/// A crisp monitor outline with a stand. macOS tints the template for light/dark menus.
+/// A simple MacBook outline with its screen open about 60° from the base.
+/// macOS tints the template for light/dark menu bars; only alpha is drawn.
 fn tray_image() -> tray_icon::Icon {
+    const SCREEN: [(f64, f64); 4] = [(11.0, 5.0), (20.0, 5.0), (13.0, 17.1), (4.0, 17.1)];
+    const SCREEN_INNER: [(f64, f64); 4] = [(11.8, 6.3), (17.7, 6.3), (12.2, 15.8), (6.3, 15.8)];
+
     let (w, h) = (24u32, 24u32);
     let mut rgba = vec![0u8; (w * h * 4) as usize];
     for y in 0..h {
         for x in 0..w {
-            let mut covered = 0u8;
-            for sub_y in 0..4 {
-                for sub_x in 0..4 {
-                    let px = x as f64 + (sub_x as f64 + 0.5) / 4.0;
-                    let py = y as f64 + (sub_y as f64 + 0.5) / 4.0;
-                    let outer = rounded_rect_contains(px, py, 12.0, 9.5, 10.0, 7.0, 2.0);
-                    let inner = rounded_rect_contains(px, py, 12.0, 9.2, 8.1, 4.9, 0.7);
-                    let stem = (11.0..=13.0).contains(&px) && (16.4..=20.2).contains(&py);
-                    let foot = rounded_rect_contains(px, py, 12.0, 20.8, 4.7, 0.8, 0.8);
-                    covered += u8::from((outer && !inner) || stem || foot);
+            let mut covered = 0u16;
+            for sub_y in 0..8 {
+                for sub_x in 0..8 {
+                    let px = x as f64 + (sub_x as f64 + 0.5) / 8.0;
+                    let py = y as f64 + (sub_y as f64 + 0.5) / 8.0;
+                    let screen =
+                        quad_contains(px, py, &SCREEN) && !quad_contains(px, py, &SCREEN_INNER);
+                    let base = (px - px.clamp(3.7, 20.3)).hypot(py - 19.4) <= 0.85;
+                    covered += u16::from(screen || base);
                 }
             }
-            rgba[((y * w + x) * 4 + 3) as usize] = ((covered as u16 * 255) / 16) as u8;
+            rgba[((y * w + x) * 4 + 3) as usize] = ((covered * 255) / 64) as u8;
         }
     }
     tray_icon::Icon::from_rgba(rgba, w, h).expect("valid rgba icon")
 }
 
-fn rounded_rect_contains(x: f64, y: f64, cx: f64, cy: f64, hx: f64, hy: f64, r: f64) -> bool {
-    let qx = (x - cx).abs() - (hx - r);
-    let qy = (y - cy).abs() - (hy - r);
-    qx.max(0.0).hypot(qy.max(0.0)) + qx.max(qy).min(0.0) <= r
+fn quad_contains(x: f64, y: f64, quad: &[(f64, f64); 4]) -> bool {
+    let (mut positive, mut negative) = (false, false);
+    for index in 0..4 {
+        let (ax, ay) = quad[index];
+        let (bx, by) = quad[(index + 1) % 4];
+        let cross = (bx - ax) * (y - ay) - (by - ay) * (x - ax);
+        positive |= cross > 0.0;
+        negative |= cross < 0.0;
+        if positive && negative {
+            return false;
+        }
+    }
+    true
 }
 
 // ---------------------------------------------------------------------------
