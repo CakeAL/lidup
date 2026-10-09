@@ -1,5 +1,5 @@
 //! lidup library: display enumeration/control, settings, the auto-off rule, and
-//! launch-at-login agent management.
+//! launch-at-login management.
 
 pub mod auto;
 pub mod config;

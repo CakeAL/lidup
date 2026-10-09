@@ -15,9 +15,6 @@
 use anyhow::{bail, Context, Result};
 use smappservice_rs::{AppService, ServiceType};
 
-/// The fixed bundle identifier / label for lidup.
-pub const LABEL: &str = "com.lidup.app";
-
 fn main_app() -> AppService {
     AppService::new(ServiceType::MainApp)
 }
@@ -35,7 +32,6 @@ pub fn register() -> Result<()> {
         Ok(()) => Ok(()),
         Err(e) => {
             // Surface a friendlier message and point the user at System Settings.
-            let _ = service.status();
             bail!("failed to register launch at login: {e} (approve it in System Settings → General → Login Items if prompted)")
         }
     }
@@ -54,8 +50,7 @@ pub fn unregister() -> Result<()> {
 fn ensure_in_bundle() -> Result<()> {
     let exe = std::env::current_exe().context("could not resolve current executable")?;
     let path = exe.to_string_lossy();
-    let in_bundle =
-        path.contains(".app/Contents/MacOS/") || std::env::var_os("SM_APP_TEST").is_some(); // escape-hatch for tests
+    let in_bundle = path.contains(".app/Contents/MacOS/");
     if in_bundle {
         Ok(())
     } else {
@@ -64,16 +59,5 @@ fn ensure_in_bundle() -> Result<()> {
              not a bare binary. Run: open target/release/lidup.app, then tick \
              \"Start at Login\"."
         )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn bundle_check_accepts_app_paths() {
-        assert!(LABEL == "com.lidup.app");
-        // ensure_in_bundle uses current_exe; just assert the label/id sanity.
     }
 }

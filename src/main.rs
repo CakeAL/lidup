@@ -175,9 +175,6 @@ fn snapshot(
                     builtin: true,
                     on: false,
                     asleep: false,
-                    vendor: 0,
-                    model: 0,
-                    serial: 0,
                     width: 0,
                     height: 0,
                     name: "Built-in Display".to_string(),
@@ -265,6 +262,14 @@ impl WakeGuard {
     }
 }
 
+#[derive(Default)]
+struct AutoState {
+    missing_since: Option<Instant>,
+    bound_was_present: bool,
+    wake_guard: WakeGuard,
+    hdr_recovery: hdr::HdrRecovery,
+}
+
 /// Re-evaluate the current display situation and publish a fresh snapshot.
 ///
 /// A bound monitor must remain absent for five seconds before the built-in is
@@ -273,15 +278,18 @@ impl WakeGuard {
 fn refresh(
     proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     settings: &mut Settings,
-    missing_since: &mut Option<Instant>,
-    bound_was_present: &mut bool,
-    wake_guard: &mut WakeGuard,
-    hdr_recovery: &mut hdr::HdrRecovery,
+    state: &mut AutoState,
     current_angle: Option<u16>,
     angle_available: bool,
     angle_intent: Option<bool>,
     angle_last_action: &mut Option<(bool, Instant)>,
 ) -> Option<Instant> {
+    let AutoState {
+        missing_since,
+        bound_was_present,
+        wake_guard,
+        hdr_recovery,
+    } = state;
     hdr_recovery.bind(settings.bound_key.as_deref());
     // auto = None means the user wants full manual control: do NOT touch the built-in
     // at all (no auto-off, no auto-restore). Otherwise the app would fight the user —
@@ -423,109 +431,6 @@ fn refresh(
     Some(retry_at.map_or(watchdog, |at| at.min(watchdog)))
 }
 
-#[cfg(test)]
-mod worker_tests {
-    use super::{needs_builtin_restore, observe_power_events, WakeGuard, WorkerEvent};
-    use objc2_app_kit::{
-        NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceScreensDidWakeNotification,
-        NSWorkspaceWillSleepNotification,
-    };
-    use std::sync::mpsc;
-    use std::time::{Duration, Instant};
-
-    #[test]
-    fn unplug_restores_even_if_coregraphics_still_reports_builtin_active() {
-        assert!(needs_builtin_restore(true, false, true, true));
-    }
-
-    #[test]
-    fn missing_bound_monitor_restores_disabled_builtin() {
-        assert!(needs_builtin_restore(false, false, true, false));
-    }
-
-    #[test]
-    fn another_external_keeps_manual_restore_setting() {
-        assert!(!needs_builtin_restore(false, true, false, true));
-    }
-
-    #[test]
-    fn wake_does_not_reapply_auto_off_when_monitor_returns() {
-        let now = Instant::now();
-        let mut guard = WakeGuard::default();
-        guard.sleep();
-        guard.wake(now);
-        guard.observe_bound(false, now + Duration::from_secs(2));
-        guard.observe_bound(true, now + Duration::from_secs(12));
-        guard.observe_bound(true, now + Duration::from_secs(70));
-        assert!(guard.suppress_auto_off);
-    }
-
-    #[test]
-    fn confirmed_unplug_rearms_auto_off_after_wake() {
-        let now = Instant::now();
-        let mut guard = WakeGuard::default();
-        guard.wake(now);
-        guard.observe_bound(false, now + Duration::from_secs(2));
-        guard.observe_bound(false, now + Duration::from_secs(7));
-        assert!(guard.suppress_auto_off);
-        guard.observe_bound(false, now + Duration::from_secs(61));
-        assert!(!guard.suppress_auto_off);
-    }
-
-    #[test]
-    fn brief_unplug_after_wake_does_not_rearm_auto_off() {
-        let now = Instant::now();
-        let mut guard = WakeGuard::default();
-        guard.wake(now);
-        guard.observe_bound(true, now + Duration::from_secs(61));
-        guard.observe_bound(false, now + Duration::from_secs(62));
-        guard.observe_bound(true, now + Duration::from_secs(64));
-        assert!(guard.suppress_auto_off);
-    }
-
-    #[test]
-    fn angle_switch_waits_until_wake_display_configuration_settles() {
-        let now = Instant::now();
-        let mut guard = WakeGuard::default();
-        guard.wake(now);
-        assert!(!guard.angle_can_switch(now + Duration::from_secs(7)));
-        assert!(guard.angle_can_switch(now + Duration::from_secs(8)));
-        assert!(guard.suppress_auto_off);
-    }
-
-    #[test]
-    fn workspace_power_notifications_reach_worker() {
-        let (tx, rx) = mpsc::channel();
-        let _observers = observe_power_events(tx);
-        let center = NSWorkspace::sharedWorkspace().notificationCenter();
-        unsafe {
-            center.postNotificationName_object(NSWorkspaceWillSleepNotification, None);
-        }
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            WorkerEvent::PowerSleep
-        ));
-        unsafe {
-            center.postNotificationName_object(NSWorkspaceDidWakeNotification, None);
-        }
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            WorkerEvent::PowerWake {
-                screens_ready: false
-            }
-        ));
-        unsafe {
-            center.postNotificationName_object(NSWorkspaceScreensDidWakeNotification, None);
-        }
-        assert!(matches!(
-            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            WorkerEvent::PowerWake {
-                screens_ready: true
-            }
-        ));
-    }
-}
-
 fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receiver<WorkerEvent>) {
     let mut settings = Settings::load();
 
@@ -536,10 +441,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
         let _ = settings.save();
     }
 
-    let mut missing_since = None;
-    let mut bound_was_present = false;
-    let mut wake_guard = WakeGuard::default();
-    let mut hdr_recovery = hdr::HdrRecovery::default();
+    let mut auto_state = AutoState::default();
     let mut pending_refresh = Some(Instant::now());
     let mut angle_reader = lid_angle::Reader::default();
     let mut angle_gate = lid_angle::Gate::default();
@@ -568,13 +470,13 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                     WorkerEvent::DisplayChanged => {
                         // Start the absence confirmation after the latest completed
                         // reconfiguration, including one delivered on system wake.
-                        missing_since = None;
-                        hdr_recovery.request_observation();
+                        auto_state.missing_since = None;
+                        auto_state.hdr_recovery.request_observation();
                         pending_refresh = Some(Instant::now() + Duration::from_millis(700));
                         continue;
                     }
                     WorkerEvent::PowerSleep => {
-                        if !wake_guard.sleeping {
+                        if !auto_state.wake_guard.sleeping {
                             let external = displays::online_displays().into_iter().find(|d| {
                                 !d.builtin
                                     && d.on
@@ -582,11 +484,14 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                                     && Some(d.key.as_str()) == settings.bound_key.as_deref()
                             });
                             if let Some(external) = external {
-                                hdr_recovery.capture_current_preference(external.id);
+                                auto_state
+                                    .hdr_recovery
+                                    .capture_current_preference(external.id);
                             }
                         }
                         diagnostics::record("power sleep");
-                        wake_guard.sleep();
+                        auto_state.hdr_recovery.sleep();
+                        auto_state.wake_guard.sleep();
                         angle_reader.reset();
                         current_angle = None;
                         next_angle_poll = None;
@@ -595,23 +500,25 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                     }
                     WorkerEvent::PowerWake { screens_ready } => {
                         let now = Instant::now();
-                        if wake_guard.sleeping || wake_guard.grace_until.is_none() {
-                            wake_guard.wake(now);
+                        if auto_state.wake_guard.sleeping
+                            || auto_state.wake_guard.grace_until.is_none()
+                        {
+                            auto_state.wake_guard.wake(now);
                             angle_reader.reset();
                             angle_gate.reset();
                             current_angle = None;
                             angle_last_action = None;
                             next_angle_poll = Some(now + Duration::from_secs(1));
                         }
-                        hdr_recovery.wake(now);
+                        auto_state.hdr_recovery.wake(now);
                         if screens_ready {
-                            hdr_recovery.screens_woke(now);
+                            auto_state.hdr_recovery.screens_woke(now);
                         }
                         diagnostics::record(&format!(
                             "power wake screens_ready={screens_ready} HDR restore pending={}",
-                            hdr_recovery.restore_pending()
+                            auto_state.hdr_recovery.restore_pending()
                         ));
-                        missing_since = None;
+                        auto_state.missing_since = None;
                         pending_refresh = Some(
                             now + if screens_ready {
                                 Duration::from_millis(200)
@@ -631,7 +538,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         let _ = displays::toggle_safe(id);
                     }
                     WorkerEvent::SetBound(key) => {
-                        wake_guard.reset();
+                        auto_state.wake_guard.reset();
                         angle_gate.reset();
                         angle_last_action = None;
                         let going_to_manual = key.is_none();
@@ -717,10 +624,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
             pending_refresh = refresh(
                 &proxy,
                 &mut settings,
-                &mut missing_since,
-                &mut bound_was_present,
-                &mut wake_guard,
-                &mut hdr_recovery,
+                &mut auto_state,
                 current_angle,
                 angle_reader.available(),
                 angle_gate.open(),
@@ -1015,7 +919,13 @@ impl ApplicationHandler<UserEvent> for App {
             let snap = *snapshot(&settings, false, None, false);
             let ms = MenuState::build(&snap, &self.update_status);
             let icon = tray_image();
-            match TrayIconBuilderCompat::build(icon, ms.menu.clone()) {
+            let tray = tray_icon::TrayIconBuilder::new()
+                .with_menu(Box::new(ms.menu.clone()))
+                .with_tooltip("lidup · 显示器管理")
+                .with_icon(icon)
+                .with_icon_as_template(true)
+                .build();
+            match tray {
                 Ok(t) => self.tray = Some(t),
                 Err(e) => eprintln!("failed to create tray icon: {e}"),
             }
@@ -1172,18 +1082,6 @@ impl ApplicationHandler<UserEvent> for App {
 // ---------------------------------------------------------------------------
 // Tray icon helpers
 // ---------------------------------------------------------------------------
-
-struct TrayIconBuilderCompat;
-impl TrayIconBuilderCompat {
-    fn build(icon: tray_icon::Icon, menu: Menu) -> Result<TrayIcon, tray_icon::Error> {
-        tray_icon::TrayIconBuilder::new()
-            .with_menu(Box::new(menu))
-            .with_tooltip("lidup · 显示器管理")
-            .with_icon(icon)
-            .with_icon_as_template(true)
-            .build()
-    }
-}
 
 /// A simple MacBook outline with its screen open about 60° from the base.
 /// macOS tints the template for light/dark menu bars; only alpha is drawn.
@@ -1362,4 +1260,107 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod worker_tests {
+    use super::{needs_builtin_restore, observe_power_events, WakeGuard, WorkerEvent};
+    use objc2_app_kit::{
+        NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceScreensDidWakeNotification,
+        NSWorkspaceWillSleepNotification,
+    };
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn unplug_restores_even_if_coregraphics_still_reports_builtin_active() {
+        assert!(needs_builtin_restore(true, false, true, true));
+    }
+
+    #[test]
+    fn missing_bound_monitor_restores_disabled_builtin() {
+        assert!(needs_builtin_restore(false, false, true, false));
+    }
+
+    #[test]
+    fn another_external_keeps_manual_restore_setting() {
+        assert!(!needs_builtin_restore(false, true, false, true));
+    }
+
+    #[test]
+    fn wake_does_not_reapply_auto_off_when_monitor_returns() {
+        let now = Instant::now();
+        let mut guard = WakeGuard::default();
+        guard.sleep();
+        guard.wake(now);
+        guard.observe_bound(false, now + Duration::from_secs(2));
+        guard.observe_bound(true, now + Duration::from_secs(12));
+        guard.observe_bound(true, now + Duration::from_secs(70));
+        assert!(guard.suppress_auto_off);
+    }
+
+    #[test]
+    fn confirmed_unplug_rearms_auto_off_after_wake() {
+        let now = Instant::now();
+        let mut guard = WakeGuard::default();
+        guard.wake(now);
+        guard.observe_bound(false, now + Duration::from_secs(2));
+        guard.observe_bound(false, now + Duration::from_secs(7));
+        assert!(guard.suppress_auto_off);
+        guard.observe_bound(false, now + Duration::from_secs(61));
+        assert!(!guard.suppress_auto_off);
+    }
+
+    #[test]
+    fn brief_unplug_after_wake_does_not_rearm_auto_off() {
+        let now = Instant::now();
+        let mut guard = WakeGuard::default();
+        guard.wake(now);
+        guard.observe_bound(true, now + Duration::from_secs(61));
+        guard.observe_bound(false, now + Duration::from_secs(62));
+        guard.observe_bound(true, now + Duration::from_secs(64));
+        assert!(guard.suppress_auto_off);
+    }
+
+    #[test]
+    fn angle_switch_waits_until_wake_display_configuration_settles() {
+        let now = Instant::now();
+        let mut guard = WakeGuard::default();
+        guard.wake(now);
+        assert!(!guard.angle_can_switch(now + Duration::from_secs(7)));
+        assert!(guard.angle_can_switch(now + Duration::from_secs(8)));
+        assert!(guard.suppress_auto_off);
+    }
+
+    #[test]
+    fn workspace_power_notifications_reach_worker() {
+        let (tx, rx) = mpsc::channel();
+        let _observers = observe_power_events(tx);
+        let center = NSWorkspace::sharedWorkspace().notificationCenter();
+        unsafe {
+            center.postNotificationName_object(NSWorkspaceWillSleepNotification, None);
+        }
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WorkerEvent::PowerSleep
+        ));
+        unsafe {
+            center.postNotificationName_object(NSWorkspaceDidWakeNotification, None);
+        }
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WorkerEvent::PowerWake {
+                screens_ready: false
+            }
+        ));
+        unsafe {
+            center.postNotificationName_object(NSWorkspaceScreensDidWakeNotification, None);
+        }
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            WorkerEvent::PowerWake {
+                screens_ready: true
+            }
+        ));
+    }
 }

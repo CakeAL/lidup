@@ -21,7 +21,7 @@ pub struct Settings {
     /// `None` keeps the original external-monitor-only auto rule.
     #[serde(default)]
     pub open_above_angle: Option<u16>,
-    /// True if lidup is set to launch at login (a LaunchAgent is installed).
+    /// True if lidup is registered to launch at login through SMAppService.
     pub launch_at_login: bool,
 }
 

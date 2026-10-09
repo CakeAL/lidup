@@ -70,11 +70,7 @@ pub fn enable(id: u32) -> bool {
         }
         let set: unsafe extern "C" fn(Obj, Sel, i8) =
             std::mem::transmute(objc_msgSend as *const ());
-        set(
-            display,
-            sel_registerName(b"setPreferHDRModes:\0".as_ptr().cast()),
-            1,
-        );
+        set(display, sel_registerName(c"setPreferHDRModes:".as_ptr()), 1);
         true
     })
     .unwrap_or(false);
@@ -92,7 +88,7 @@ fn with_display<T>(id: u32, f: impl FnOnce(Obj) -> T) -> Option<T> {
 
     unsafe {
         let _pool = AutoreleasePool::new();
-        let manager_class = objc_getClass(b"MPDisplayMgr\0".as_ptr().cast());
+        let manager_class = objc_getClass(c"MPDisplayMgr".as_ptr());
         if manager_class.is_null() {
             return None;
         }
@@ -111,11 +107,11 @@ fn with_display<T>(id: u32, f: impl FnOnce(Obj) -> T) -> Option<T> {
                 std::mem::transmute(objc_msgSend as *const ());
             let at: unsafe extern "C" fn(Obj, Sel, usize) -> Obj =
                 std::mem::transmute(objc_msgSend as *const ());
-            let n = count(displays, sel_registerName(b"count\0".as_ptr().cast()));
+            let n = count(displays, sel_registerName(c"count".as_ptr()));
             for index in 0..n {
                 let display = at(
                     displays,
-                    sel_registerName(b"objectAtIndex:\0".as_ptr().cast()),
+                    sel_registerName(c"objectAtIndex:".as_ptr()),
                     index,
                 );
                 if !display.is_null()
@@ -131,7 +127,7 @@ fn with_display<T>(id: u32, f: impl FnOnce(Obj) -> T) -> Option<T> {
         }
         let release: unsafe extern "C" fn(Obj, Sel) =
             std::mem::transmute(objc_msgSend as *const ());
-        release(manager, sel_registerName(b"release\0".as_ptr().cast()));
+        release(manager, sel_registerName(c"release".as_ptr()));
         result
     }
 }
@@ -186,6 +182,21 @@ impl HdrRecovery {
                 ..Self::default()
             };
         }
+    }
+
+    /// A notification wake can end before HDR is restored. Keep the last awake
+    /// preference, but discard that wake's deadlines and attempts so the next
+    /// wake gets its own recovery window, even hours later.
+    pub fn sleep(&mut self) {
+        if self.pending {
+            crate::diagnostics::record("HDR recovery interrupted by sleep; preference retained");
+        }
+        self.pending = false;
+        self.ready_at = None;
+        self.expires_at = None;
+        self.attempts = 0;
+        self.off_since = None;
+        self.observe_requested = false;
     }
 
     pub fn wake(&mut self, now: Instant) {
@@ -297,7 +308,8 @@ impl HdrRecovery {
             }
             return None;
         }
-        if self.expires_at.is_some_and(|expires| now >= expires) || self.attempts >= 3 {
+        if self.expires_at.is_some_and(|expires| now >= expires) {
+            crate::diagnostics::record(&format!("HDR recovery timed out id={id}"));
             self.pending = false;
             return None;
         }
@@ -320,6 +332,15 @@ impl HdrRecovery {
                 supported: true,
                 enabled: false,
             }) => {
+                // Read back the final request before ending recovery. A third
+                // successful request still needs a chance to be confirmed.
+                if self.attempts >= 3 {
+                    crate::diagnostics::record(&format!(
+                        "HDR recovery still disabled after 3 requests id={id}"
+                    ));
+                    self.pending = false;
+                    return None;
+                }
                 crate::diagnostics::record(&format!("HDR wake observed SDR id={id}"));
                 let _ = restore(id);
                 self.attempts += 1;
@@ -405,6 +426,118 @@ mod tests {
         assert_eq!(recovery.ready_at, Some(ready));
         recovery.wake(now + Duration::from_secs(2));
         assert_eq!(recovery.ready_at, Some(ready));
+    }
+
+    #[test]
+    fn interrupted_notification_wake_gets_a_fresh_recovery_after_long_sleep() {
+        let now = Instant::now();
+        let mut recovery = HdrRecovery::default();
+        recovery.bind(Some("monitor-a"));
+        recovery.observe_requested_with(3, now, |_| Some(HDR_ON), |_| unreachable!());
+        recovery.sleep();
+        recovery.wake(now);
+        recovery.screens_woke(now);
+        // Match the observed notification wake: the monitor reports SDR, the
+        // restore request fails as it sleeps again, then hours pass.
+        recovery.observe_requested_with(
+            3,
+            now + Duration::from_secs(4),
+            |_| Some(HDR_OFF),
+            |_| false,
+        );
+        assert_eq!(recovery.attempts, 1);
+        recovery.sleep();
+        recovery.sleep(); // NSWorkspace also sends a screen-sleep notification.
+        assert!(recovery.last_enabled);
+        assert!(!recovery.restore_pending());
+
+        let next_wake = now + Duration::from_secs(2 * 60 * 60);
+        recovery.wake(next_wake);
+        recovery.screens_woke(next_wake);
+        recovery.wake(next_wake + Duration::from_millis(1));
+        assert_eq!(
+            recovery.expires_at,
+            Some(next_wake + Duration::from_secs(45))
+        );
+        assert_eq!(recovery.attempts, 0);
+        let requests = Cell::new(0);
+        recovery.observe_requested_with(
+            3,
+            next_wake + Duration::from_secs(1),
+            |_| Some(HDR_OFF),
+            |_| {
+                requests.set(requests.get() + 1);
+                true
+            },
+        );
+        assert_eq!(requests.get(), 1);
+        recovery.observe_requested_with(
+            3,
+            next_wake + Duration::from_secs(3),
+            |_| Some(HDR_ON),
+            |_| unreachable!(),
+        );
+        assert!(!recovery.restore_pending());
+        assert!(recovery.last_enabled);
+    }
+
+    #[test]
+    fn final_restore_request_is_confirmed_without_more_requests_or_polling() {
+        let now = Instant::now();
+        let mut recovery = HdrRecovery::default();
+        recovery.bind(Some("monitor-a"));
+        recovery.last_enabled = true;
+        recovery.wake(now);
+        let requests = Cell::new(0);
+        for seconds in [3, 5, 7] {
+            recovery.observe_requested_with(
+                3,
+                now + Duration::from_secs(seconds),
+                |_| Some(HDR_OFF),
+                |_| {
+                    requests.set(requests.get() + 1);
+                    true
+                },
+            );
+        }
+        recovery.observe_requested_with(
+            3,
+            now + Duration::from_secs(9),
+            |_| Some(HDR_ON),
+            |_| unreachable!(),
+        );
+        assert_eq!(requests.get(), 3);
+        assert!(!recovery.restore_pending());
+        assert!(recovery.last_enabled);
+        recovery.observe_requested_with(
+            3,
+            now + Duration::from_secs(11),
+            |_| unreachable!("stable state must not poll HDR"),
+            |_| unreachable!(),
+        );
+    }
+
+    #[test]
+    fn failed_restore_stops_after_three_requests() {
+        let now = Instant::now();
+        let mut recovery = HdrRecovery::default();
+        recovery.bind(Some("monitor-a"));
+        recovery.last_enabled = true;
+        recovery.wake(now);
+        let requests = Cell::new(0);
+        for seconds in [3, 5, 7, 9] {
+            recovery.observe_requested_with(
+                3,
+                now + Duration::from_secs(seconds),
+                |_| Some(HDR_OFF),
+                |_| {
+                    requests.set(requests.get() + 1);
+                    false
+                },
+            );
+        }
+        assert_eq!(requests.get(), 3);
+        assert!(!recovery.restore_pending());
     }
 
     #[test]

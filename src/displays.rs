@@ -66,12 +66,6 @@ pub struct DisplayInfo {
     /// True when the display is asleep (e.g. the lid is closed). A sleeping built-in
     /// must NOT be force-lit — that's how the lid stays "off".
     pub asleep: bool,
-    #[allow(dead_code)]
-    pub vendor: u32,
-    #[allow(dead_code)]
-    pub model: u32,
-    #[allow(dead_code)]
-    pub serial: u32,
     pub width: u32,
     pub height: u32,
     pub name: String,
@@ -116,7 +110,7 @@ pub fn online_displays() -> Vec<DisplayInfo> {
             return Vec::new();
         }
         ids.truncate(count as usize);
-        ids.into_iter().map(|id| describe(id)).collect()
+        ids.into_iter().map(describe).collect()
     }
 }
 
@@ -144,20 +138,12 @@ fn describe(id: DisplayID) -> DisplayInfo {
             builtin,
             on,
             asleep,
-            vendor,
-            model,
-            serial,
             width,
             height,
             name,
             key,
         }
     }
-}
-
-/// Return the built-in display, if present.
-pub fn builtin_display() -> Option<DisplayInfo> {
-    online_displays().into_iter().find(|d| d.builtin)
 }
 
 /// True if the display is currently on/enabled.
@@ -220,15 +206,6 @@ fn configure_enabled_with(id: DisplayID, enabled: bool, permanent: bool) -> Resu
     }
 }
 
-/// If there is a built-in display and it differs from `on`, set it.
-pub fn set_builtin(on: bool) -> Result<(), String> {
-    if let Some(b) = builtin_display() {
-        set_enabled(b.id, on)
-    } else {
-        Ok(())
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Event-driven display-change notifications (replaces polling).
 // ---------------------------------------------------------------------------
@@ -237,7 +214,8 @@ pub fn set_builtin(on: bool) -> Result<(), String> {
 /// changes (a display is inserted, removed, re-arranged, powered on/off, …).
 /// Stored globally (not thread-local) because CoreGraphics invokes the callback on
 /// its own internal thread, not the thread that registered the callback.
-static RECONFIG: OnceLock<Mutex<Option<Box<dyn Fn() + Send + Sync>>>> = OnceLock::new();
+type ReconfigHandler = Box<dyn Fn() + Send + Sync>;
+static RECONFIG: OnceLock<Mutex<Option<ReconfigHandler>>> = OnceLock::new();
 
 // CoreGraphics calls the handler once *before* a configuration transaction and
 // again after it. The online list is only authoritative in the latter callback.
@@ -296,18 +274,6 @@ pub fn toggle_safe(id: DisplayID) -> Result<(), String> {
     set_enabled(id, !is_on(id))
 }
 
-/// Ensure at least one display stays lit. If every display is off, force the
-/// built-in back on (a powered-off built-in leaves the online list, so we scan ids).
-/// Safe to call after any change. Only acts when *nothing* is lit — so it never
-/// fights a manual toggle while an external is still on.
-pub fn ensure_one_on() {
-    if active_count() > 0 {
-        return;
-    }
-    recover_builtin();
-}
-
-/// Force the built-in display back on, even if it is currently powered off (and
 /// Force the built-in display back on (truly enabled), even if it is currently
 /// powered off (and thus absent from the online list). Scans the low display ids.
 ///
