@@ -167,9 +167,14 @@ pub struct HdrRecovery {
     ready_at: Option<Instant>,
     expires_at: Option<Instant>,
     attempts: u8,
+    error: Option<String>,
 }
 
 impl HdrRecovery {
+    pub fn take_error(&mut self) -> Option<String> {
+        self.error.take()
+    }
+
     pub fn restore_pending(&self) -> bool {
         self.pending
     }
@@ -205,6 +210,7 @@ impl HdrRecovery {
             self.ready_at = Some(now + Duration::from_secs(3));
             self.expires_at = Some(now + Duration::from_secs(45));
             self.attempts = 0;
+            self.error = None;
         }
     }
 
@@ -311,6 +317,7 @@ impl HdrRecovery {
         if self.expires_at.is_some_and(|expires| now >= expires) {
             crate::diagnostics::record(&format!("HDR recovery timed out id={id}"));
             self.pending = false;
+            self.error = Some("显示器在恢复期限内未能确认开启 HDR".into());
             return None;
         }
         let ready = self.ready_at.unwrap_or(now);
@@ -339,6 +346,7 @@ impl HdrRecovery {
                         "HDR recovery still disabled after 3 requests id={id}"
                     ));
                     self.pending = false;
+                    self.error = Some("连续三次请求后 HDR 仍未开启".into());
                     return None;
                 }
                 crate::diagnostics::record(&format!("HDR wake observed SDR id={id}"));
@@ -538,6 +546,8 @@ mod tests {
         }
         assert_eq!(requests.get(), 3);
         assert!(!recovery.restore_pending());
+        assert!(recovery.take_error().is_some());
+        assert!(recovery.take_error().is_none());
     }
 
     #[test]

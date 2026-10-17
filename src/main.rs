@@ -69,6 +69,7 @@ enum UserEvent {
     UpdateInstalled(Result<String, String>),
     Menu(tray_icon::menu::MenuEvent),
     Tray,
+    Notice(String),
     Exit,
 }
 
@@ -105,6 +106,22 @@ fn short_error(error: &str) -> String {
         format!("{label}…")
     } else {
         label
+    }
+}
+
+/// Keep the full error in diagnostics; the menu shows its first line.
+fn report_result(
+    proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    action: &str,
+    result: Result<(), String>,
+) -> bool {
+    if let Err(error) = result {
+        let message = format!("{action}失败：{error}");
+        diagnostics::record(&message);
+        let _ = proxy.send_event(UserEvent::Notice(message));
+        false
+    } else {
+        true
     }
 }
 
@@ -273,6 +290,7 @@ struct AutoState {
     builtin_recovery: recovery::Recovery,
     quitting: bool,
     bound_ready: bool,
+    trace_requested: bool,
 }
 
 /// Re-evaluate the current display situation and publish a fresh snapshot.
@@ -297,6 +315,7 @@ fn refresh(
         builtin_recovery,
         quitting,
         bound_ready,
+        trace_requested,
     } = state;
     hdr_recovery.bind(settings.bound_key.as_deref());
     // auto = None means the user wants full manual control: do NOT touch the built-in
@@ -311,13 +330,16 @@ fn refresh(
     if settings.bound_key.is_none() || *quitting {
         *bound_ready = false;
         let list = displays::online_displays();
+        if std::mem::take(trace_requested) {
+            diagnostics::record(&format!("display snapshot {list:?}"));
+        }
         let retry = builtin_recovery.step(
             Instant::now(),
             list.iter().any(|d| d.builtin && d.on),
             |permanent| displays::enable_builtin_once(settings.builtin_id, permanent),
         );
         if let Err(error) = &retry {
-            diagnostics::record(&format!("builtin recovery failed: {error}"));
+            report_result(proxy, "恢复内建屏", Err(error.clone()));
         }
         *missing_since = None;
         *bound_was_present = false;
@@ -335,6 +357,9 @@ fn refresh(
     let before_key = settings.builtin_key.clone();
 
     let displays_now: Vec<DisplayInfo> = displays::online_displays();
+    if std::mem::take(trace_requested) {
+        diagnostics::record(&format!("display snapshot {displays_now:?}"));
+    }
     if let Some(b) = displays_now.iter().find(|d| d.builtin) {
         settings.builtin_id = Some(b.id);
         settings.builtin_key = Some(b.key.clone());
@@ -404,13 +429,16 @@ fn refresh(
             }
             if let Some((id, false)) = auto::decide(settings, &displays_now) {
                 if !displays::is_last_active(id) {
-                    let _ = displays::set_enabled(id, false);
+                    report_result(proxy, "关闭内建屏", displays::set_enabled(id, false));
                 }
             }
         }
         if let Some(external) = external {
             if !builtin_may_change {
                 retry_at = hdr_recovery.observe(external.id, Instant::now());
+                if let Some(error) = hdr_recovery.take_error() {
+                    report_result(proxy, "恢复 HDR", Err(error));
+                }
             }
         }
     } else {
@@ -461,12 +489,14 @@ fn refresh(
     );
     match recovery_retry {
         Ok(Some(at)) => retry_at = Some(retry_at.map_or(at, |other| other.min(at))),
-        Err(error) => diagnostics::record(&format!("builtin recovery failed: {error}")),
+        Err(error) => {
+            report_result(proxy, "恢复内建屏", Err(error));
+        }
         _ => {}
     }
 
     if settings.builtin_id != before_id || settings.builtin_key != before_key {
-        let _ = settings.save();
+        report_result(proxy, "保存配置", settings.save());
     }
     let _ = proxy.send_event(UserEvent::Snapshot(snapshot(
         settings,
@@ -489,13 +519,21 @@ fn should_track_angle(settings: &Settings, state: &AutoState) -> bool {
 }
 
 fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receiver<WorkerEvent>) {
-    let mut settings = Settings::load();
+    let (mut settings, config_loaded) = match Settings::load_checked() {
+        Ok(settings) => (settings, true),
+        Err(error) => {
+            report_result(&proxy, "加载配置", Err(error));
+            (Settings::default(), false)
+        }
+    };
 
     // Sync the launch-at-login flag from the OS once at startup (we don't poll it).
     let os_launch = launch::check_reg_status();
     if settings.launch_at_login != os_launch {
         settings.launch_at_login = os_launch;
-        let _ = settings.save();
+        if config_loaded {
+            report_result(&proxy, "保存配置", settings.save());
+        }
     }
 
     let mut auto_state = AutoState::default();
@@ -526,6 +564,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
             Ok(ev) => {
                 match ev {
                     WorkerEvent::DisplayChanged => {
+                        auto_state.trace_requested = true;
                         next_angle_poll = None;
                         // Start the absence confirmation after the latest completed
                         // reconfiguration, including one delivered on system wake.
@@ -567,10 +606,12 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         continue;
                     }
                     WorkerEvent::PowerWake { screens_ready } => {
+                        auto_state.trace_requested = true;
                         let now = Instant::now();
                         if auto_state.wake_guard.sleeping
                             || auto_state.wake_guard.grace_until.is_none()
                         {
+                            diagnostics::begin_wake();
                             auto_state.wake_guard.wake(now);
                             angle_reader.reset();
                             angle_gate.reset();
@@ -600,11 +641,12 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         auto_state.builtin_recovery.cancel();
                         // A manual toggle is an explicit user override: disable the
                         // auto-off rule so it doesn't immediately fight the change.
-                        if settings.bound_key.is_some() {
+                        if report_result(&proxy, "切换显示器", displays::toggle_safe(id))
+                            && settings.bound_key.is_some()
+                        {
                             settings.bound_key = None;
-                            let _ = settings.save();
+                            report_result(&proxy, "保存配置", settings.save());
                         }
-                        let _ = displays::toggle_safe(id);
                     }
                     WorkerEvent::SetBound(key) => {
                         auto_state.builtin_recovery.cancel();
@@ -613,7 +655,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         angle_last_action = None;
                         let going_to_manual = key.is_none();
                         settings.bound_key = key;
-                        let _ = settings.save();
+                        report_result(&proxy, "保存配置", settings.save());
                         // Switching to manual (None) ends the auto-off: if the built-in
                         // was disabled by the auto rule, bring it back on now. Otherwise
                         // it would stay off (a fully-disabled built-in doesn't even
@@ -627,7 +669,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                     WorkerEvent::SetAngleThreshold(threshold) => {
                         auto_state.builtin_recovery.cancel();
                         settings.open_above_angle = threshold;
-                        let _ = settings.save();
+                        report_result(&proxy, "保存配置", settings.save());
                         angle_gate.configure(threshold);
                         angle_last_action = None;
                         next_angle_poll = None;
@@ -644,9 +686,20 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                             } else {
                                 launch::unregister()
                             };
-                            if result.is_ok() {
-                                settings.launch_at_login = enabled;
-                                let _ = settings.save();
+                            if report_result(
+                                &proxy,
+                                "设置登录项",
+                                result.map_err(|error| error.to_string()),
+                            ) {
+                                settings.launch_at_login = launch::check_reg_status();
+                                report_result(&proxy, "保存配置", settings.save());
+                                if enabled && !settings.launch_at_login {
+                                    report_result(
+                                        &proxy,
+                                        "启用登录项",
+                                        Err("请在系统设置 → 通用 → 登录项中批准 lidup".into()),
+                                    );
+                                }
                             }
                         }
                     }
@@ -794,11 +847,12 @@ struct MenuState {
     start_login: CheckMenuItem,
     check_update: MenuItem,
     update_status: MenuItem,
+    notice: MenuItem,
     signature: String,
 }
 
 impl MenuState {
-    fn build(snap: &Snapshot, update: &UpdateStatus) -> MenuState {
+    fn build(snap: &Snapshot, update: &UpdateStatus, notice_text: Option<&str>) -> MenuState {
         let menu = Menu::new();
 
         let title = MenuItem::with_id(
@@ -911,6 +965,21 @@ impl MenuState {
         );
         let _ = menu.append(&update_status);
         let _ = menu.append(&PredefinedMenuItem::separator());
+        let notice = MenuItem::with_id(
+            "notice",
+            notice_text
+                .map(short_error)
+                .unwrap_or_else(|| "最近操作：无提示".into()),
+            notice_text.is_some(),
+            None,
+        );
+        let _ = menu.append(&notice);
+        let _ = menu.append(&MenuItem::with_id(
+            "export-diagnostics",
+            "导出诊断日志…",
+            true,
+            None,
+        ));
         let quit = MenuItem::with_id("quit", "退出 lidup", true, None);
         let _ = menu.append(&quit);
 
@@ -926,6 +995,7 @@ impl MenuState {
             start_login,
             check_update,
             update_status,
+            notice,
             signature: structural_signature(snap),
         }
     }
@@ -963,6 +1033,14 @@ impl MenuState {
         false
     }
 
+    fn set_notice(&self, text: Option<&str>) {
+        self.notice.set_text(
+            text.map(short_error)
+                .unwrap_or_else(|| "最近操作：无提示".into()),
+        );
+        self.notice.set_enabled(text.is_some());
+    }
+
     fn set_update_status(&self, status: &UpdateStatus) {
         self.check_update.set_enabled(!matches!(
             status,
@@ -998,6 +1076,8 @@ struct App {
     tray: Option<TrayIcon>,
     menu: Option<MenuState>,
     snapshot: Option<Snapshot>,
+    notice: Option<String>,
+    proxy: winit::event_loop::EventLoopProxy<UserEvent>,
 }
 
 impl ApplicationHandler<UserEvent> for App {
@@ -1008,7 +1088,7 @@ impl ApplicationHandler<UserEvent> for App {
             // tray menu right after startup.
             let settings = Settings::load();
             let snap = *snapshot(&settings, false, None, false);
-            let ms = MenuState::build(&snap, &self.update_status);
+            let ms = MenuState::build(&snap, &self.update_status, self.notice.as_deref());
             let icon = tray_image();
             let tray = tray_icon::TrayIconBuilder::new()
                 .with_menu(Box::new(ms.menu.clone()))
@@ -1034,7 +1114,8 @@ impl ApplicationHandler<UserEvent> for App {
                     // changed (hot-plug), which is when we rebuild the menu.
                     Some(ms) => ms.update(&snap),
                     None => {
-                        let first = MenuState::build(&snap, &self.update_status);
+                        let first =
+                            MenuState::build(&snap, &self.update_status, self.notice.as_deref());
                         if let Some(tray) = &self.tray {
                             tray.set_menu(Some(Box::new(first.menu.clone())));
                         }
@@ -1043,7 +1124,8 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 };
                 if rebuild {
-                    let fresh = MenuState::build(&snap, &self.update_status);
+                    let fresh =
+                        MenuState::build(&snap, &self.update_status, self.notice.as_deref());
                     if let Some(tray) = &self.tray {
                         tray.set_menu(Some(Box::new(fresh.menu.clone())));
                     }
@@ -1082,9 +1164,44 @@ impl ApplicationHandler<UserEvent> for App {
                     menu.set_update_status(&self.update_status);
                 }
             }
+            UserEvent::Notice(message) => {
+                self.notice = Some(message);
+                if let Some(menu) = &self.menu {
+                    menu.set_notice(self.notice.as_deref());
+                }
+            }
             UserEvent::Menu(ev) => {
                 let id = ev.id();
-                if id == "quit" {
+                if id == "notice" {
+                    self.notice = None;
+                    if let Some(menu) = &self.menu {
+                        menu.set_notice(None);
+                    }
+                } else if id == "export-diagnostics" {
+                    match choose_diagnostic_path() {
+                        Ok(Some(path)) => {
+                            let mut context = format!("latest_notice={:?}\n", self.notice);
+                            if let Some(snap) = &self.snapshot {
+                                context.push_str(&format!("bound={:?} threshold={:?} angle={:?} sensor_available={} auto_off_suppressed={} control_available={} login_enabled={}\ndisplays={:#?}\n",
+                                    snap.bound, snap.open_above_angle, snap.current_angle, snap.angle_available,
+                                    snap.auto_off_suppressed, snap.control_ok, snap.launch_at_login, snap.displays));
+                            }
+                            let proxy = self.proxy.clone();
+                            std::thread::spawn(move || {
+                                let message = match diagnostics::export(&path, &context) {
+                                    Ok(()) => format!("诊断日志已导出至 {}", path.display()),
+                                    Err(error) => format!("导出诊断日志失败：{error}"),
+                                };
+                                diagnostics::record(&message);
+                                let _ = proxy.send_event(UserEvent::Notice(message));
+                            });
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            report_result(&self.proxy, "导出诊断日志", Err(error));
+                        }
+                    }
+                } else if id == "quit" {
                     let _ = self.cmd_tx.send(WorkerEvent::Quit);
                 } else if id == "check-update" {
                     if !matches!(
@@ -1173,6 +1290,25 @@ impl ApplicationHandler<UserEvent> for App {
 // ---------------------------------------------------------------------------
 // Tray icon helpers
 // ---------------------------------------------------------------------------
+
+fn choose_diagnostic_path() -> Result<Option<std::path::PathBuf>, String> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSModalResponseOK, NSSavePanel};
+    use objc2_foundation::NSString;
+    let mtm = MainThreadMarker::new().ok_or_else(|| "保存对话框必须在主线程打开".to_string())?;
+    let panel = NSSavePanel::savePanel(mtm);
+    panel.setTitle(Some(&NSString::from_str("导出 lidup 诊断日志")));
+    panel.setNameFieldStringValue(&NSString::from_str("lidup-diagnostics.txt"));
+    panel.setCanCreateDirectories(true);
+    if panel.runModal() != NSModalResponseOK {
+        return Ok(None);
+    }
+    panel
+        .URL()
+        .and_then(|url| url.path())
+        .map(|path| Some(std::path::PathBuf::from(path.to_string())))
+        .ok_or_else(|| "无法读取所选保存位置".to_string())
+}
 
 /// A simple MacBook outline with its screen open about 60° from the base.
 /// macOS tints the template for light/dark menu bars; only alpha is drawn.
@@ -1295,6 +1431,7 @@ fn set_menu_bar_only() {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    diagnostics::record("application started");
     set_menu_bar_only();
 
     // Set up the tray/menu event handlers once, forwarding into the winit loop so
@@ -1327,11 +1464,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Fire whenever a display is inserted/removed/powered — forwards to the worker.
     let reconfig_tx = cmd_tx.clone();
-    let _ = displays::register_reconfig_handler(move || {
-        let _ = reconfig_tx.send(WorkerEvent::DisplayChanged);
-    });
+    report_result(
+        &proxy,
+        "注册显示器通知",
+        displays::register_reconfig_handler(move || {
+            let _ = reconfig_tx.send(WorkerEvent::DisplayChanged);
+        }),
+    );
 
     let update_proxy = proxy.clone();
+    let app_proxy = proxy.clone();
     std::thread::Builder::new()
         .name("lidup-worker".into())
         .spawn(move || worker(proxy, cmd_rx))?;
@@ -1356,6 +1498,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         tray: None,
         menu: None,
         snapshot: None,
+        notice: None,
+        proxy: app_proxy,
     };
     event_loop.run_app(&mut app)?;
     Ok(())

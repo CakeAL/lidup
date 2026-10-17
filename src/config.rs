@@ -1,7 +1,10 @@
 //! Persistent settings for lidup.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::io::Write;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Serialize, Deserialize, Clone, Debug)]
 pub struct Settings {
@@ -51,29 +54,90 @@ impl Settings {
             .join("config.json")
     }
 
-    /// Load settings from disk; returns defaults (and does not error) if missing.
+    /// UI snapshots can use defaults; the worker surfaces load errors explicitly.
     pub fn load() -> Self {
-        let path = Self::path();
-        match std::fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-            Err(_) => Settings::default(),
+        Self::load_checked().unwrap_or_default()
+    }
+
+    pub fn load_checked() -> Result<Self, String> {
+        Self::load_from(&Self::path())
+    }
+
+    fn load_from(path: &Path) -> Result<Self, String> {
+        match std::fs::read_to_string(path) {
+            Ok(text) => {
+                serde_json::from_str(&text).map_err(|error| format!("配置格式错误：{error}"))
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(format!("无法读取配置：{error}")),
         }
     }
 
     pub fn save(&self) -> Result<(), String> {
-        let path = Self::path();
-        if let Some(dir) = path.parent() {
-            std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
-        }
-        let s = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-        std::fs::write(&path, s).map_err(|e| e.to_string())?;
-        Ok(())
+        let text = serde_json::to_string_pretty(self).map_err(|error| error.to_string())?;
+        write_atomic(&Self::path(), text.as_bytes()).map_err(|error| error.to_string())
     }
+}
+
+/// Write beside the destination and rename only after the full file is synced.
+/// A failed write leaves the previous config or exported report intact.
+pub(crate) fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let temp = parent.join(format!(
+        ".lidup-{}-{nonce}-{}.tmp",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)?;
+    let result = (|| {
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 #[cfg(test)]
 mod tests {
-    use super::Settings;
+    use super::{write_atomic, Settings};
+
+    #[test]
+    fn corrupt_config_is_reported_and_preserved() {
+        let root = std::env::temp_dir().join(format!("lidup-config-test-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("config.json");
+        write_atomic(&path, b"broken-json").unwrap();
+        assert!(Settings::load_from(&path).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"broken-json");
+        write_atomic(
+            &path,
+            serde_json::to_string(&Settings::default())
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(Settings::load_from(&path).is_ok());
+        // A failed replacement must not leave temporary files behind.
+        assert!(write_atomic(&root, b"cannot replace a directory").is_err());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn existing_settings_keep_angle_control_disabled() {

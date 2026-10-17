@@ -20,6 +20,7 @@ https://github.com/CakeAL/lidup/releases
 - **显示器** — 勾选表示已开启；点击对应显示器可手动切换。
 - **登录时启动** — 开机自启（注册登录项）。
 - **检查更新…** — 检查 GitHub 的最新正式 Release；有新版本时可从菜单下载安装并重启。
+- **导出诊断日志…** — 选择保存位置，导出版本、当前显示器快照及最近两份日志。操作失败时菜单会显示原因；点击该提示可清除。
 - **退出 lidup** — 退出，并恢复内建显示器。
 
 ---
@@ -36,7 +37,7 @@ https://github.com/CakeAL/lidup/releases
 
 ## 配置
 
-设置保存在 `~/Library/Application Support/lidup/config.json`（可用 `LIDUP_CONFIG` 环境变量改路径）。
+设置保存在 `~/Library/Application Support/lidup/config.json`（可用 `LIDUP_CONFIG` 环境变量改路径）。配置采用原子替换写入；读取失败会显示原因，并保留原文件。诊断日志仅保存在本机，导出操作不会额外读取 HDR 模式或角度传感器。
 
 ## 开发
 
