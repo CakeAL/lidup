@@ -212,6 +212,20 @@ impl Reader {
     }
 }
 
+/// No timer or open HID handle when angle control cannot affect a display.
+/// Unsupported sensors retry slowly; only threshold crossings need faster reads.
+pub fn poll_interval(tracking: bool, settling: bool, available: bool) -> Option<Duration> {
+    tracking.then(|| {
+        if !available {
+            Duration::from_secs(5)
+        } else if settling {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(1)
+        }
+    })
+}
+
 /// Debounce the crossing and hold the existing side within 2° of the threshold.
 #[derive(Default)]
 pub struct Gate {
@@ -279,6 +293,24 @@ impl Gate {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inactive_control_has_no_timer_and_unavailable_sensor_backs_off() {
+        assert_eq!(poll_interval(false, false, true), None);
+        assert_eq!(poll_interval(false, true, false), None);
+        assert_eq!(
+            poll_interval(true, false, false),
+            Some(Duration::from_secs(5))
+        );
+        assert_eq!(
+            poll_interval(true, false, true),
+            Some(Duration::from_secs(1))
+        );
+        assert_eq!(
+            poll_interval(true, true, true),
+            Some(Duration::from_millis(250))
+        );
+    }
 
     #[test]
     fn decoding_uses_whole_degrees_and_rejects_invalid_reports() {

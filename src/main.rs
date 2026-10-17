@@ -272,6 +272,7 @@ struct AutoState {
     hdr_recovery: hdr::HdrRecovery,
     builtin_recovery: recovery::Recovery,
     quitting: bool,
+    bound_ready: bool,
 }
 
 /// Re-evaluate the current display situation and publish a fresh snapshot.
@@ -295,6 +296,7 @@ fn refresh(
         hdr_recovery,
         builtin_recovery,
         quitting,
+        bound_ready,
     } = state;
     hdr_recovery.bind(settings.bound_key.as_deref());
     // auto = None means the user wants full manual control: do NOT touch the built-in
@@ -302,10 +304,12 @@ fn refresh(
     // e.g. re-light the built-in after they closed the lid. Only in auto (bound)
     // mode do we manage the built-in.
     if wake_guard.sleeping {
+        *bound_ready = false;
         builtin_recovery.cancel();
         return None;
     }
     if settings.bound_key.is_none() || *quitting {
+        *bound_ready = false;
         let list = displays::online_displays();
         let retry = builtin_recovery.step(
             Instant::now(),
@@ -338,6 +342,9 @@ fn refresh(
     let bound_present = displays_now
         .iter()
         .any(|d| !d.builtin && Some(d.key.as_str()) == settings.bound_key.as_deref());
+    *bound_ready = displays_now.iter().any(|d| {
+        !d.builtin && d.on && !d.asleep && Some(d.key.as_str()) == settings.bound_key.as_deref()
+    });
     wake_guard.observe_bound(bound_present, Instant::now());
     let mut retry_at = None;
     if bound_present {
@@ -473,6 +480,14 @@ fn refresh(
     Some(retry_at.map_or(watchdog, |at| at.min(watchdog)))
 }
 
+fn should_track_angle(settings: &Settings, state: &AutoState) -> bool {
+    settings.bound_key.is_some()
+        && settings.open_above_angle.is_some()
+        && state.bound_ready
+        && !state.wake_guard.sleeping
+        && !state.quitting
+}
+
 fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receiver<WorkerEvent>) {
     let mut settings = Settings::load();
 
@@ -489,7 +504,8 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
     let mut angle_gate = lid_angle::Gate::default();
     angle_gate.configure(settings.open_above_angle);
     let mut current_angle = None;
-    let mut next_angle_poll = Some(Instant::now());
+    let mut next_angle_poll = None;
+    let mut angle_available = false;
     let mut last_angle_snapshot = Instant::now() - Duration::from_secs(2);
     let mut angle_last_action = None;
 
@@ -510,6 +526,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
             Ok(ev) => {
                 match ev {
                     WorkerEvent::DisplayChanged => {
+                        next_angle_poll = None;
                         // Start the absence confirmation after the latest completed
                         // reconfiguration, including one delivered on system wake.
                         auto_state.missing_since = None;
@@ -534,6 +551,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                                     .capture_current_preference(external.id);
                             }
                         }
+                        auto_state.bound_ready = false;
                         auto_state.builtin_recovery.cancel();
                         if auto_state.quitting {
                             let _ = proxy.send_event(UserEvent::Exit);
@@ -558,7 +576,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                             angle_gate.reset();
                             current_angle = None;
                             angle_last_action = None;
-                            next_angle_poll = Some(now + Duration::from_secs(1));
+                            next_angle_poll = None;
                         }
                         auto_state.hdr_recovery.wake(now);
                         if screens_ready {
@@ -612,10 +630,12 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         let _ = settings.save();
                         angle_gate.configure(threshold);
                         angle_last_action = None;
-                        next_angle_poll = Some(Instant::now());
+                        next_angle_poll = None;
                     }
                     WorkerEvent::SampleAngle => {
-                        next_angle_poll = Some(Instant::now());
+                        if !auto_state.wake_guard.sleeping {
+                            next_angle_poll = Some(Instant::now());
+                        }
                     }
                     WorkerEvent::SetLaunchAtLogin(enabled) => {
                         if let Some(enabled) = enabled {
@@ -651,22 +671,22 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
         let now = Instant::now();
         if next_angle_poll.is_some_and(|due| now >= due) {
             let previous_angle = current_angle;
-            let previous_available = angle_reader.available();
+            let previous_available = angle_available;
             current_angle = angle_reader.sample(now);
+            angle_available = angle_reader.available();
             angle_gate.configure(settings.open_above_angle);
             let crossed = angle_gate.observe(current_angle, now);
-            let interval = if settings.bound_key.is_some() && settings.open_above_angle.is_some() {
-                if angle_gate.settling() {
-                    Duration::from_millis(250)
-                } else {
-                    Duration::from_secs(1)
-                }
-            } else {
-                Duration::from_secs(30)
-            };
-            next_angle_poll = Some(now + interval);
+            let interval = lid_angle::poll_interval(
+                should_track_angle(&settings, &auto_state),
+                angle_gate.settling(),
+                angle_available,
+            );
+            next_angle_poll = interval.map(|interval| now + interval);
+            if interval.is_none() {
+                angle_reader.reset();
+            }
             if crossed
-                || angle_reader.available() != previous_available
+                || angle_available != previous_available
                 || (current_angle != previous_angle
                     && now.duration_since(last_angle_snapshot) >= Duration::from_secs(2))
             {
@@ -686,10 +706,17 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                 &mut settings,
                 &mut auto_state,
                 current_angle,
-                angle_reader.available(),
+                angle_available,
                 angle_gate.open(),
                 &mut angle_last_action,
             );
+            if should_track_angle(&settings, &auto_state) {
+                next_angle_poll.get_or_insert_with(Instant::now);
+            } else {
+                next_angle_poll = None;
+                angle_reader.reset();
+                angle_gate.reset();
+            }
             if auto_state.quitting && auto_state.builtin_recovery.deadline().is_none() {
                 let _ = proxy.send_event(UserEvent::Exit);
                 return;
@@ -1277,8 +1304,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proxy = event_loop.create_proxy();
 
     let tray_proxy = proxy.clone();
-    tray_icon::TrayIconEvent::set_event_handler(Some(move |_event| {
-        let _ = tray_proxy.send_event(UserEvent::Tray);
+    tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
+        if matches!(
+            event,
+            tray_icon::TrayIconEvent::Click {
+                button: tray_icon::MouseButton::Left | tray_icon::MouseButton::Right,
+                button_state: tray_icon::MouseButtonState::Down,
+                ..
+            }
+        ) {
+            let _ = tray_proxy.send_event(UserEvent::Tray);
+        }
     }));
     let menu_proxy = proxy.clone();
     tray_icon::menu::MenuEvent::set_event_handler(Some(move |event| {
@@ -1327,7 +1363,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 #[cfg(test)]
 mod worker_tests {
-    use super::{needs_builtin_restore, observe_power_events, WakeGuard, WorkerEvent};
+    use super::{
+        needs_builtin_restore, observe_power_events, should_track_angle, AutoState, Settings,
+        WakeGuard, WorkerEvent,
+    };
+
+    #[test]
+    fn angle_tracking_requires_live_external_and_stops_during_sleep_or_quit() {
+        let mut settings = Settings {
+            bound_key: Some("external".into()),
+            open_above_angle: Some(90),
+            ..Settings::default()
+        };
+        let mut state = AutoState::default();
+        assert!(!should_track_angle(&settings, &state));
+        state.bound_ready = true;
+        assert!(should_track_angle(&settings, &state));
+        state.wake_guard.sleep();
+        assert!(!should_track_angle(&settings, &state));
+        state.wake_guard.wake(Instant::now());
+        settings.open_above_angle = None;
+        assert!(!should_track_angle(&settings, &state));
+        settings.open_above_angle = Some(90);
+        state.quitting = true;
+        assert!(!should_track_angle(&settings, &state));
+    }
+
     use objc2_app_kit::{
         NSWorkspace, NSWorkspaceDidWakeNotification, NSWorkspaceScreensDidWakeNotification,
         NSWorkspaceWillSleepNotification,
