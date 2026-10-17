@@ -8,4 +8,5 @@ pub mod displays;
 pub mod hdr;
 pub mod launch;
 pub mod lid_angle;
+pub mod recovery;
 pub mod updates;

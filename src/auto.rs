@@ -49,24 +49,6 @@ pub fn decide(settings: &Settings, list: &[displays::DisplayInfo]) -> Option<(u3
     }
 }
 
-/// Apply the rule to a single settled snapshot. The worker must use the same
-/// snapshot it checked for a bound external; re-enumerating could catch a
-/// different, transient state halfway through wake.
-pub fn apply_auto_with_list(settings: &mut Settings, list: &[displays::DisplayInfo]) {
-    if let Some(b) = list.iter().find(|d| d.builtin) {
-        settings.builtin_id = Some(b.id);
-        settings.builtin_key = Some(b.key.clone());
-    }
-    if let Some((id, enabled)) = decide(settings, list) {
-        if enabled {
-            // An unplug reconfiguration can roll back the first enable request.
-            displays::recover_builtin_with_id(Some(id));
-        } else if !displays::is_last_active(id) {
-            let _ = displays::set_enabled(id, false);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

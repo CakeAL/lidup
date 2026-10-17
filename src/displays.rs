@@ -274,19 +274,6 @@ pub fn toggle_safe(id: DisplayID) -> Result<(), String> {
     set_enabled(id, !is_on(id))
 }
 
-/// Force the built-in display back on (truly enabled), even if it is currently
-/// powered off (and thus absent from the online list). Scans the low display ids.
-///
-/// This mirrors the Dusk/BetterDisplay "recover" logic: recovering is not a one-shot
-/// call. A physical unplug leaves macOS mid-reconfiguration, so the first enable
-/// attempt can be silently rolled back. Instead we open a short **confirmation
-/// window** and re-assert the enable repeatedly (with a permanent config, which the
-/// system is more likely to accept after the hardware set changed) until the built-in
-/// is confirmed back online, or the window ends.
-pub fn recover_builtin() {
-    recover_builtin_with_id(None);
-}
-
 fn find_builtin_id(cached_id: Option<DisplayID>) -> Option<DisplayID> {
     online_displays()
         .iter()
@@ -296,42 +283,9 @@ fn find_builtin_id(cached_id: Option<DisplayID>) -> Option<DisplayID> {
         .or_else(|| (1..=16u32).find(|&id| builtin_probe(id)))
 }
 
-/// Open the built-in temporarily while the bound external is still connected.
-/// A session configuration is tried first so the monitor arrangement is not
-/// written permanently for a quick glance at the laptop display.
-pub fn show_builtin_for_angle(cached_id: Option<DisplayID>) {
-    let Some(bid) = find_builtin_id(cached_id) else {
-        return;
-    };
-    for _ in 0..3 {
-        let _ = configure_enabled_with(bid, true, false);
-        if online_displays().iter().any(|d| d.builtin && d.on) {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(250));
-    }
-    // The session request can be rolled back by macOS. Use the proven unplug
-    // recovery only when the less disruptive attempts did not light the panel.
-    recover_builtin_with_id(Some(bid));
-}
-
-/// Like [`recover_builtin`], but try the persisted built-in id before scanning.
-/// Display ids are not necessarily in the small range used by the fallback.
-pub fn recover_builtin_with_id(cached_id: Option<DisplayID>) {
-    let Some(bid) = find_builtin_id(cached_id) else {
-        return;
-    };
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        let _ = configure_enabled_with(bid, true, true);
-        // Confirmed online? (A truly-enabled built-in rejoins the online list.)
-        if online_displays().iter().any(|d| d.builtin && d.on) {
-            return;
-        }
-        if std::time::Instant::now() >= deadline {
-            return;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(300));
-    }
+/// Perform one forced recovery request. Scheduling and cancellation belong to
+/// the worker; never block it with a retry loop.
+pub fn enable_builtin_once(cached_id: Option<DisplayID>, permanent: bool) -> Result<(), String> {
+    let id = find_builtin_id(cached_id).ok_or_else(|| "找不到内建显示器".to_string())?;
+    configure_enabled_with(id, true, permanent)
 }

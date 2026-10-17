@@ -6,7 +6,7 @@
 //! auto-off rule and pushes a snapshot to the winit event loop, which renders the
 //! menu-bar menu. Menu item ids are turned into commands on the worker thread.
 
-use lidup::{auto, config, diagnostics, displays, hdr, launch, lid_angle, updates};
+use lidup::{auto, config, diagnostics, displays, hdr, launch, lid_angle, recovery, updates};
 
 use block2::RcBlock;
 use config::Settings;
@@ -238,7 +238,9 @@ impl WakeGuard {
     }
 
     fn reset(&mut self) {
+        let sleeping = self.sleeping;
         *self = Self::default();
+        self.sleeping = sleeping;
     }
 
     fn angle_can_switch(&self, now: Instant) -> bool {
@@ -268,6 +270,8 @@ struct AutoState {
     bound_was_present: bool,
     wake_guard: WakeGuard,
     hdr_recovery: hdr::HdrRecovery,
+    builtin_recovery: recovery::Recovery,
+    quitting: bool,
 }
 
 /// Re-evaluate the current display situation and publish a fresh snapshot.
@@ -289,13 +293,28 @@ fn refresh(
         bound_was_present,
         wake_guard,
         hdr_recovery,
+        builtin_recovery,
+        quitting,
     } = state;
     hdr_recovery.bind(settings.bound_key.as_deref());
     // auto = None means the user wants full manual control: do NOT touch the built-in
     // at all (no auto-off, no auto-restore). Otherwise the app would fight the user —
     // e.g. re-light the built-in after they closed the lid. Only in auto (bound)
     // mode do we manage the built-in.
-    if settings.bound_key.is_none() {
+    if wake_guard.sleeping {
+        builtin_recovery.cancel();
+        return None;
+    }
+    if settings.bound_key.is_none() || *quitting {
+        let list = displays::online_displays();
+        let retry = builtin_recovery.step(
+            Instant::now(),
+            list.iter().any(|d| d.builtin && d.on),
+            |permanent| displays::enable_builtin_once(settings.builtin_id, permanent),
+        );
+        if let Err(error) = &retry {
+            diagnostics::record(&format!("builtin recovery failed: {error}"));
+        }
         *missing_since = None;
         *bound_was_present = false;
         wake_guard.reset();
@@ -305,11 +324,7 @@ fn refresh(
             current_angle,
             angle_available,
         )));
-        return None;
-    }
-
-    if wake_guard.sleeping {
-        return None;
+        return retry.unwrap_or(None);
     }
 
     let before_id = settings.builtin_id;
@@ -328,6 +343,9 @@ fn refresh(
     if bound_present {
         *missing_since = None;
         *bound_was_present = true;
+        if builtin_recovery.reason() == Some(recovery::Reason::Unplug) {
+            builtin_recovery.cancel();
+        }
         let external = displays_now
             .iter()
             .find(|d| !d.builtin && Some(d.key.as_str()) == settings.bound_key.as_deref())
@@ -340,6 +358,9 @@ fn refresh(
             && current_angle.is_some()
             && angle_intent == Some(true)
             && wake_guard.angle_can_switch(Instant::now());
+        if !wants_on && builtin_recovery.reason() == Some(recovery::Reason::Angle) {
+            builtin_recovery.cancel();
+        }
         let wants_off = if angle_rule {
             current_angle.is_some()
                 && angle_intent == Some(false)
@@ -369,12 +390,16 @@ fn refresh(
         // still being debounced. A cable pull is handled by the branch below.
         if wants_on && !builtin_on && !builtin_asleep && angle_action_allowed {
             *angle_last_action = Some((true, Instant::now()));
-            displays::show_builtin_for_angle(settings.builtin_id);
+            builtin_recovery.request(recovery::Reason::Angle, Instant::now());
         } else if wants_off && angle_action_allowed {
             if angle_rule && builtin_on && !builtin_asleep {
                 *angle_last_action = Some((false, Instant::now()));
             }
-            auto::apply_auto_with_list(settings, &displays_now);
+            if let Some((id, false)) = auto::decide(settings, &displays_now) {
+                if !displays::is_last_active(id) {
+                    let _ = displays::set_enabled(id, false);
+                }
+            }
         }
         if let Some(external) = external {
             if !builtin_may_change {
@@ -382,6 +407,9 @@ fn refresh(
             }
         }
     } else {
+        if builtin_recovery.reason() == Some(recovery::Reason::Angle) {
+            builtin_recovery.cancel();
+        }
         // Only an online built-in has a trustworthy sleep state. A display
         // disabled by this app is absent from the online list and querying its
         // cached id can report "asleep" even after a real cable unplug.
@@ -407,13 +435,27 @@ fn refresh(
             let since = *missing_since.get_or_insert_with(Instant::now);
             let deadline = since + Duration::from_secs(5);
             if Instant::now() >= deadline {
-                displays::recover_builtin_with_id(settings.builtin_id);
+                builtin_recovery.request(recovery::Reason::Unplug, Instant::now());
                 *missing_since = None;
                 *bound_was_present = false;
             } else {
                 retry_at = Some(deadline);
             }
         }
+    }
+
+    if displays_now.iter().any(|d| d.builtin && d.asleep) {
+        builtin_recovery.cancel();
+    }
+    let recovery_retry = builtin_recovery.step(
+        Instant::now(),
+        displays_now.iter().any(|d| d.builtin && d.on),
+        |permanent| displays::enable_builtin_once(settings.builtin_id, permanent),
+    );
+    match recovery_retry {
+        Ok(Some(at)) => retry_at = Some(retry_at.map_or(at, |other| other.min(at))),
+        Err(error) => diagnostics::record(&format!("builtin recovery failed: {error}")),
+        _ => {}
     }
 
     if settings.builtin_id != before_id || settings.builtin_key != before_key {
@@ -472,6 +514,9 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         // reconfiguration, including one delivered on system wake.
                         auto_state.missing_since = None;
                         auto_state.hdr_recovery.request_observation();
+                        auto_state
+                            .builtin_recovery
+                            .defer(Instant::now() + Duration::from_millis(700));
                         pending_refresh = Some(Instant::now() + Duration::from_millis(700));
                         continue;
                     }
@@ -488,6 +533,11 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                                     .hdr_recovery
                                     .capture_current_preference(external.id);
                             }
+                        }
+                        auto_state.builtin_recovery.cancel();
+                        if auto_state.quitting {
+                            let _ = proxy.send_event(UserEvent::Exit);
+                            return;
                         }
                         diagnostics::record("power sleep");
                         auto_state.hdr_recovery.sleep();
@@ -529,6 +579,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         continue;
                     }
                     WorkerEvent::Toggle(id) => {
+                        auto_state.builtin_recovery.cancel();
                         // A manual toggle is an explicit user override: disable the
                         // auto-off rule so it doesn't immediately fight the change.
                         if settings.bound_key.is_some() {
@@ -538,6 +589,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         let _ = displays::toggle_safe(id);
                     }
                     WorkerEvent::SetBound(key) => {
+                        auto_state.builtin_recovery.cancel();
                         auto_state.wake_guard.reset();
                         angle_gate.reset();
                         angle_last_action = None;
@@ -549,10 +601,13 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         // it would stay off (a fully-disabled built-in doesn't even
                         // recover on lid open, since it's software-disabled, not asleep).
                         if going_to_manual {
-                            displays::recover_builtin_with_id(settings.builtin_id);
+                            auto_state
+                                .builtin_recovery
+                                .request(recovery::Reason::Manual, Instant::now());
                         }
                     }
                     WorkerEvent::SetAngleThreshold(threshold) => {
+                        auto_state.builtin_recovery.cancel();
                         settings.open_above_angle = threshold;
                         let _ = settings.save();
                         angle_gate.configure(threshold);
@@ -577,9 +632,14 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                     }
                     WorkerEvent::Quit => {
                         // Restore the built-in display so the user isn't left dark.
-                        displays::recover_builtin_with_id(settings.builtin_id);
-                        let _ = proxy.send_event(UserEvent::Exit);
-                        return;
+                        if auto_state.wake_guard.sleeping {
+                            let _ = proxy.send_event(UserEvent::Exit);
+                            return;
+                        }
+                        auto_state.quitting = true;
+                        auto_state
+                            .builtin_recovery
+                            .request(recovery::Reason::Quit, Instant::now());
                     }
                 }
                 pending_refresh = Some(Instant::now());
@@ -630,6 +690,10 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                 angle_gate.open(),
                 &mut angle_last_action,
             );
+            if auto_state.quitting && auto_state.builtin_recovery.deadline().is_none() {
+                let _ = proxy.send_event(UserEvent::Exit);
+                return;
+            }
         }
     }
 }
@@ -1180,14 +1244,13 @@ fn observe_power_events(tx: mpsc::Sender<WorkerEvent>) -> PowerObservers {
 /// item when it is unticked in System Settings, or the app is quit externally),
 /// restore the built-in display so the user is never left with a dark screen.
 /// The handle runs on its own thread (event-driven via a self-pipe, no polling).
-fn install_exit_guard() {
+fn install_exit_guard(tx: mpsc::Sender<WorkerEvent>) {
     use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
     use signal_hook::iterator::Signals;
     std::thread::spawn(move || {
         if let Ok(mut signals) = Signals::new([SIGHUP, SIGINT, SIGTERM]) {
             if signals.forever().next().is_some() {
-                displays::recover_builtin();
-                std::process::exit(0);
+                let _ = tx.send(WorkerEvent::Quit);
             }
         }
     });
@@ -1248,7 +1311,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // If this process is terminated (e.g. the OS kills the login item when it is
     // unticked in System Settings), make sure the built-in display comes back on.
-    install_exit_guard();
+    install_exit_guard(cmd_tx.clone());
 
     let mut app = App {
         cmd_tx,
