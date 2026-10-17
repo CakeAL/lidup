@@ -49,3 +49,7 @@ https://github.com/CakeAL/lidup/releases
 ./pack.sh                       # 打包成菜单栏应用（无 Dock 图标）
 open target/release/lidup.app   # 运行
 ```
+
+### 自动检查与发布
+
+普通 push、PR 和手动触发都会在 macOS 上运行格式检查、Clippy、单元及回归测试和构建。硬件测试默认跳过。推送 `v*` 标签时先核对标签与 Cargo 版本，再完成全部检查；只有检查成功后才打包、验证签名并发布 `lidup.zip`。构建使用 `--locked`，不会自动更新依赖。

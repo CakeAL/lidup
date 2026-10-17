@@ -3,8 +3,8 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-echo "==> cargo build --release"
-cargo build --release
+echo "==> cargo build --release --locked"
+cargo build --release --locked
 
 BIN="target/release/lidup"
 APP="target/release/lidup.app"
