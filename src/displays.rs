@@ -210,32 +210,47 @@ fn configure_enabled_with(id: DisplayID, enabled: bool, permanent: bool) -> Resu
 // Event-driven display-change notifications (replaces polling).
 // ---------------------------------------------------------------------------
 
-/// Handler invoked (on a background thread) whenever the display configuration
-/// changes (a display is inserted, removed, re-arranged, powered on/off, …).
-/// Stored globally (not thread-local) because CoreGraphics invokes the callback on
-/// its own internal thread, not the thread that registered the callback.
-type ReconfigHandler = Box<dyn Fn() + Send + Sync>;
+/// A completed CoreGraphics configuration change, including removal evidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DisplayChange {
+    pub id: DisplayID,
+    pub removed: bool,
+}
+
+type ReconfigHandler = Box<dyn Fn(DisplayChange) + Send + Sync>;
 static RECONFIG: OnceLock<Mutex<Option<ReconfigHandler>>> = OnceLock::new();
 
 // CoreGraphics calls the handler once *before* a configuration transaction and
 // again after it. The online list is only authoritative in the latter callback.
 const K_CG_DISPLAY_BEGIN_CONFIGURATION_FLAG: u32 = 1 << 0;
 
-extern "C" fn reconfig_trampoline(_display: u32, flags: u32, _user: *mut c_void) {
+const K_CG_DISPLAY_REMOVE_FLAG: u32 = 1 << 5;
+
+const fn completed_change(id: DisplayID, flags: u32) -> Option<DisplayChange> {
     if flags & K_CG_DISPLAY_BEGIN_CONFIGURATION_FLAG != 0 {
-        return;
+        return None;
     }
+    Some(DisplayChange {
+        id,
+        removed: flags & K_CG_DISPLAY_REMOVE_FLAG != 0,
+    })
+}
+
+extern "C" fn reconfig_trampoline(display: u32, flags: u32, _user: *mut c_void) {
+    let Some(change) = completed_change(display, flags) else {
+        return;
+    };
     // CoreGraphics callbacks run on a non-main thread; forward to the handler.
     if let Some(lock) = RECONFIG.get() {
         if let Some(h) = lock.lock().unwrap().as_ref() {
-            h();
+            h(change);
         }
     }
 }
 
 /// Register a callback that fires whenever the display configuration changes.
 /// Use this to wake a worker thread on insert/remove/timeout instead of polling.
-pub fn register_reconfig_handler<F: Fn() + Send + Sync + 'static>(
+pub fn register_reconfig_handler<F: Fn(DisplayChange) + Send + Sync + 'static>(
     handler: F,
 ) -> Result<(), String> {
     *RECONFIG.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(Box::new(handler));
@@ -288,4 +303,34 @@ fn find_builtin_id(cached_id: Option<DisplayID>) -> Option<DisplayID> {
 pub fn enable_builtin_once(cached_id: Option<DisplayID>, permanent: bool) -> Result<(), String> {
     let id = find_builtin_id(cached_id).ok_or_else(|| "找不到内建显示器".to_string())?;
     configure_enabled_with(id, true, permanent)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_completed_callbacks_expose_removal_evidence() {
+        assert_eq!(
+            completed_change(
+                3,
+                K_CG_DISPLAY_BEGIN_CONFIGURATION_FLAG | K_CG_DISPLAY_REMOVE_FLAG
+            ),
+            None
+        );
+        assert_eq!(
+            completed_change(3, K_CG_DISPLAY_REMOVE_FLAG),
+            Some(DisplayChange {
+                id: 3,
+                removed: true
+            })
+        );
+        assert_eq!(
+            completed_change(3, 1 << 3),
+            Some(DisplayChange {
+                id: 3,
+                removed: false
+            })
+        );
+    }
 }

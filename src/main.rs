@@ -45,7 +45,7 @@ struct Snapshot {
 /// evaluation; a missing bound monitor gets one delayed confirmation.
 enum WorkerEvent {
     /// A display was inserted, removed, re-arranged or powered on/off.
-    DisplayChanged,
+    DisplayChanged(Option<displays::DisplayChange>),
     /// User toggled a display on/off from the menu.
     Toggle(u32),
     /// User selected the external monitor to auto-off (or None).
@@ -228,7 +228,7 @@ const fn needs_builtin_restore(
 
 /// Prevent a wake-time CoreGraphics state transition from causing another
 /// private display reconfiguration. A cable pull still restores the built-in
-/// through the normal five-second absence path.
+/// through the confirmed removal path without shortening wake protection.
 #[derive(Default)]
 struct WakeGuard {
     sleeping: bool,
@@ -265,6 +265,18 @@ impl WakeGuard {
         !self.sleeping && self.angle_switch_after.is_none_or(|ready| now >= ready)
     }
 
+    fn unplug_delay(&self, now: Instant, removal_seen: bool, hdr_pending: bool) -> Duration {
+        if removal_seen
+            && !self.sleeping
+            && !hdr_pending
+            && self.grace_until.is_none_or(|until| now >= until)
+        {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_secs(5)
+        }
+    }
+
     fn observe_bound(&mut self, present: bool, now: Instant) {
         if present {
             self.absent_since = None;
@@ -282,9 +294,41 @@ impl WakeGuard {
     }
 }
 
+/// Removal evidence is tied to the selected runtime display ID. A generic mode
+/// change or watchdog observation alone must not shorten absence confirmation.
+#[derive(Default)]
+struct UnplugWatch {
+    since: Option<Instant>,
+    bound_id: Option<u32>,
+    removal_seen: bool,
+}
+
+impl UnplugWatch {
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn present(&mut self, id: u32) {
+        self.reset();
+        self.bound_id = Some(id);
+    }
+
+    fn reconfigured(&mut self, change: Option<displays::DisplayChange>) {
+        self.since = None;
+        if change.is_some_and(|change| change.removed && Some(change.id) == self.bound_id) {
+            self.removal_seen = true;
+        }
+    }
+
+    fn deadline(&mut self, now: Instant, guard: &WakeGuard, hdr_pending: bool) -> Instant {
+        let since = *self.since.get_or_insert(now);
+        since + guard.unplug_delay(now, self.removal_seen, hdr_pending)
+    }
+}
+
 #[derive(Default)]
 struct AutoState {
-    missing_since: Option<Instant>,
+    unplug: UnplugWatch,
     bound_was_present: bool,
     wake_guard: WakeGuard,
     hdr_recovery: hdr::HdrRecovery,
@@ -313,9 +357,9 @@ fn advance_builtin_recovery(
 
 /// Re-evaluate the current display situation and publish a fresh snapshot.
 ///
-/// A bound monitor must remain absent for five seconds before the built-in is
-/// restored. Wake can temporarily remove it from the online list; restoring it
-/// during that interval changes the external monitor's display configuration.
+/// A completed removal of the bound monitor uses two settled snapshots 250 ms
+/// apart. Startup, wake, HDR recovery and missing callbacks retain the five-second
+/// confirmation to avoid reconfiguring a temporarily absent external monitor.
 fn refresh(
     proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
     settings: &mut Settings,
@@ -326,7 +370,7 @@ fn refresh(
     angle_last_action: &mut Option<(bool, Instant)>,
 ) -> Option<Instant> {
     let AutoState {
-        missing_since,
+        unplug,
         bound_was_present,
         wake_guard,
         hdr_recovery,
@@ -342,6 +386,7 @@ fn refresh(
     // mode do we manage the built-in.
     if wake_guard.sleeping {
         *bound_ready = false;
+        unplug.reset();
         builtin_recovery.cancel();
         return None;
     }
@@ -357,7 +402,7 @@ fn refresh(
             builtin_recovery,
             list.iter().find(|d| d.builtin),
         );
-        *missing_since = None;
+        unplug.reset();
         *bound_was_present = false;
         wake_guard.reset();
         let _ = proxy.send_event(UserEvent::Snapshot(snapshot(
@@ -391,8 +436,8 @@ fn refresh(
     *bound_ready = external.is_some();
     wake_guard.observe_bound(bound_present, Instant::now());
     let mut retry_at = None;
-    if bound_present {
-        *missing_since = None;
+    if let Some(bound) = bound {
+        unplug.present(bound.id);
         *bound_was_present = true;
         if builtin_recovery.reason() == Some(recovery::Reason::Unplug) {
             builtin_recovery.cancel();
@@ -471,18 +516,27 @@ fn refresh(
             *bound_was_present,
         );
         if builtin_asleep || !needs_restore {
-            *missing_since = None;
+            unplug.reset();
             if builtin_on {
                 *bound_was_present = false;
             }
         } else {
-            // A monitor can briefly disappear from CGGetOnlineDisplayList during
-            // wake. Only restore the built-in if the bound monitor stays absent.
-            let since = *missing_since.get_or_insert_with(Instant::now);
-            let deadline = since + Duration::from_secs(5);
+            // Even a remove notification only describes the active list. Use
+            // the short path after wake/HDR negotiation has finished, and read
+            // the display list again before touching the built-in.
+            let now = Instant::now();
+            let first_absence = unplug.since.is_none();
+            let deadline = unplug.deadline(now, wake_guard, hdr_recovery.restore_pending());
+            if first_absence {
+                diagnostics::record(&format!(
+                    "bound absent removal_seen={} confirmation_ms={}",
+                    unplug.removal_seen,
+                    deadline.saturating_duration_since(now).as_millis()
+                ));
+            }
             if Instant::now() >= deadline {
                 builtin_recovery.request(recovery::Reason::Unplug, Instant::now());
-                *missing_since = None;
+                unplug.reset();
                 *bound_was_present = false;
             } else {
                 retry_at = Some(deadline);
@@ -561,12 +615,12 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
         match event {
             Ok(ev) => {
                 match ev {
-                    WorkerEvent::DisplayChanged => {
+                    WorkerEvent::DisplayChanged(change) => {
                         auto_state.trace_requested = true;
                         next_angle_poll = None;
                         // Start the absence confirmation after the latest completed
                         // reconfiguration, including one delivered on system wake.
-                        auto_state.missing_since = None;
+                        auto_state.unplug.reconfigured(change);
                         auto_state.hdr_recovery.request_observation();
                         auto_state
                             .builtin_recovery
@@ -589,6 +643,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                             }
                         }
                         auto_state.bound_ready = false;
+                        auto_state.unplug.reset();
                         auto_state.builtin_recovery.cancel();
                         if auto_state.quitting {
                             let _ = proxy.send_event(UserEvent::Exit);
@@ -625,7 +680,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                             "power wake screens_ready={screens_ready} HDR restore pending={}",
                             auto_state.hdr_recovery.restore_pending()
                         ));
-                        auto_state.missing_since = None;
+                        auto_state.unplug.reset();
                         pending_refresh = Some(
                             now + if screens_ready {
                                 Duration::from_millis(200)
@@ -636,6 +691,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         continue;
                     }
                     WorkerEvent::Toggle(id) => {
+                        auto_state.unplug.reset();
                         auto_state.builtin_recovery.cancel();
                         // A manual toggle is an explicit user override: disable the
                         // auto-off rule so it doesn't immediately fight the change.
@@ -647,6 +703,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         }
                     }
                     WorkerEvent::SetBound(key) => {
+                        auto_state.unplug.reset();
                         auto_state.builtin_recovery.cancel();
                         auto_state.wake_guard.reset();
                         angle_gate.reset();
@@ -1458,8 +1515,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     report_result(
         &proxy,
         "注册显示器通知",
-        displays::register_reconfig_handler(move || {
-            let _ = reconfig_tx.send(WorkerEvent::DisplayChanged);
+        displays::register_reconfig_handler(move |change| {
+            let _ = reconfig_tx.send(WorkerEvent::DisplayChanged(Some(change)));
         }),
     );
 
@@ -1476,7 +1533,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Evaluate once on launch (applies the auto rule to the current state and
     // publishes the first snapshot) so the menu is populated immediately.
-    let _ = cmd_tx.send(WorkerEvent::DisplayChanged);
+    let _ = cmd_tx.send(WorkerEvent::DisplayChanged(None));
 
     // If this process is terminated (e.g. the OS kills the login item when it is
     // unticked in System Settings), make sure the built-in display comes back on.
@@ -1502,6 +1559,86 @@ mod worker_tests {
         needs_builtin_restore, observe_power_events, should_track_angle, AutoState, Settings,
         WakeGuard, WorkerEvent,
     };
+
+    #[test]
+    fn bound_removal_uses_two_snapshots_within_one_second() {
+        let now = Instant::now();
+        let guard = WakeGuard::default();
+        let mut watch = super::UnplugWatch::default();
+        watch.present(3);
+        watch.reconfigured(Some(super::displays::DisplayChange {
+            id: 3,
+            removed: true,
+        }));
+        let first_snapshot = now + Duration::from_millis(700);
+        let due = watch.deadline(first_snapshot, &guard, false);
+        assert_eq!(due, now + Duration::from_millis(950));
+        assert_eq!(
+            watch.deadline(now + Duration::from_millis(900), &guard, false),
+            due
+        );
+        // A reconnection clears both the evidence and its confirmation clock.
+        watch.present(3);
+        assert!(!watch.removal_seen);
+        assert!(watch.since.is_none());
+    }
+
+    #[test]
+    fn startup_other_displays_and_missing_callbacks_keep_long_confirmation() {
+        let now = Instant::now();
+        let guard = WakeGuard::default();
+        let removal = Some(super::displays::DisplayChange {
+            id: 3,
+            removed: true,
+        });
+        let mut watch = super::UnplugWatch::default();
+        watch.reconfigured(removal); // no previously observed bound display
+        assert_eq!(
+            watch.deadline(now, &guard, false),
+            now + Duration::from_secs(5)
+        );
+        watch.present(4);
+        watch.reconfigured(removal); // another display's removal
+        assert_eq!(
+            watch.deadline(now, &guard, false),
+            now + Duration::from_secs(5)
+        );
+        watch.present(3);
+        watch.reconfigured(None); // watchdog/initial refresh has no removal evidence
+        assert_eq!(
+            watch.deadline(now, &guard, false),
+            now + Duration::from_secs(5)
+        );
+    }
+
+    #[test]
+    fn wake_and_hdr_recovery_never_use_fast_unplug_confirmation() {
+        let now = Instant::now();
+        let mut guard = WakeGuard::default();
+        assert_eq!(guard.unplug_delay(now, true, true), Duration::from_secs(5));
+        guard.sleep();
+        assert_eq!(guard.unplug_delay(now, true, false), Duration::from_secs(5));
+        guard.wake(now);
+        assert_eq!(
+            guard.unplug_delay(now + Duration::from_secs(30), true, false),
+            Duration::from_secs(5)
+        );
+        assert_eq!(
+            guard.unplug_delay(now + Duration::from_secs(61), true, false),
+            Duration::from_millis(250)
+        );
+        let mut watch = super::UnplugWatch::default();
+        watch.present(3);
+        watch.reconfigured(Some(super::displays::DisplayChange {
+            id: 3,
+            removed: true,
+        }));
+        watch.reset(); // the worker clears evidence on sleep, wake and rebinding
+        assert_eq!(
+            watch.deadline(now + Duration::from_secs(61), &guard, false),
+            now + Duration::from_secs(66)
+        );
+    }
 
     #[test]
     fn angle_tracking_requires_live_external_and_stops_during_sleep_or_quit() {
