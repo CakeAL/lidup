@@ -30,7 +30,7 @@ pub struct Settings {
 
 impl Default for Settings {
     fn default() -> Self {
-        Settings {
+        Self {
             bound_key: None,
             restore_builtin: true,
             builtin_id: None,

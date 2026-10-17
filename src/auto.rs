@@ -4,20 +4,11 @@
 use crate::config::Settings;
 use crate::displays;
 
-fn bound_present(list: &[displays::DisplayInfo], key: &str) -> bool {
-    list.iter().any(|d| !d.builtin && d.key == key)
-}
-
-fn bound_ready(list: &[displays::DisplayInfo], key: &str) -> bool {
-    list.iter()
-        .any(|d| !d.builtin && d.key == key && d.on && !d.asleep)
-}
-
 /// Pure decision: if a change is needed, return the built-in id to set and the
 /// desired state. `None` means "leave the built-in alone".
 pub fn decide(settings: &Settings, list: &[displays::DisplayInfo]) -> Option<(u32, bool)> {
     let bound = settings.bound_key.as_deref()?;
-    let present = bound_present(list, bound);
+    let external = list.iter().find(|d| !d.builtin && d.key == bound);
     let builtin = list.iter().find(|d| d.builtin);
     let id = builtin.map(|d| d.id).or(settings.builtin_id)?;
     let builtin_on = builtin.is_some_and(|d| d.on);
@@ -29,10 +20,10 @@ pub fn decide(settings: &Settings, list: &[displays::DisplayInfo]) -> Option<(u3
         return None;
     }
 
-    if present {
+    if let Some(external) = external {
         // A waking external display can be online before it is active. Turning
         // off the built-in then reconfigures the display set during HDR setup.
-        if !bound_ready(list, bound) {
+        if !external.on || external.asleep {
             return None;
         }
         // The bound external is connected: keep the built-in off.

@@ -186,7 +186,7 @@ pub struct Reader {
 }
 
 impl Reader {
-    pub fn available(&self) -> bool {
+    pub const fn available(&self) -> bool {
         self.sensor.is_some()
     }
 
@@ -235,7 +235,7 @@ pub struct Gate {
 }
 
 impl Gate {
-    pub fn reset(&mut self) {
+    pub const fn reset(&mut self) {
         self.open = None;
         self.candidate = None;
     }
@@ -249,11 +249,11 @@ impl Gate {
         }
     }
 
-    pub fn open(&self) -> Option<bool> {
+    pub const fn open(&self) -> Option<bool> {
         self.open
     }
 
-    pub fn settling(&self) -> bool {
+    pub const fn settling(&self) -> bool {
         self.candidate.is_some()
     }
 

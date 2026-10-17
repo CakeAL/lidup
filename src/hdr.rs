@@ -171,11 +171,11 @@ pub struct HdrRecovery {
 }
 
 impl HdrRecovery {
-    pub fn take_error(&mut self) -> Option<String> {
+    pub const fn take_error(&mut self) -> Option<String> {
         self.error.take()
     }
 
-    pub fn restore_pending(&self) -> bool {
+    pub const fn restore_pending(&self) -> bool {
         self.pending
     }
 
@@ -257,7 +257,7 @@ impl HdrRecovery {
         retry
     }
 
-    pub fn request_observation(&mut self) {
+    pub const fn request_observation(&mut self) {
         self.observe_requested = true;
     }
 

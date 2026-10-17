@@ -1,4 +1,5 @@
 //! One display request per worker turn; retries never sleep or outlive their context.
+use crate::displays::DisplayInfo;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7,6 +8,25 @@ pub enum Reason {
     Angle,
     Manual,
     Quit,
+}
+
+/// The worker's settled observation. A missing built-in is software-disabled;
+/// an asleep panel must never receive a recovery request.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltinState {
+    Awake,
+    Off,
+    Asleep,
+}
+
+impl From<Option<&DisplayInfo>> for BuiltinState {
+    fn from(display: Option<&DisplayInfo>) -> Self {
+        match display {
+            Some(display) if display.asleep => Self::Asleep,
+            Some(display) if display.on => Self::Awake,
+            _ => Self::Off,
+        }
+    }
 }
 
 struct Task {
@@ -59,15 +79,22 @@ impl Recovery {
     pub fn step(
         &mut self,
         now: Instant,
-        builtin_on: bool,
+        builtin: BuiltinState,
         mut enable: impl FnMut(bool) -> Result<(), String>,
     ) -> Result<Option<Instant>, String> {
+        if builtin == BuiltinState::Asleep {
+            self.cancel();
+            return Ok(None);
+        }
         let Some(task) = &mut self.task else {
             return Ok(None);
         };
         // The first forced request is necessary after unplug even when CG says
         // the built-in is active while its panel is still dark.
-        if task.attempts > 0 && builtin_on {
+        if now < task.next && now < task.expires {
+            return Ok(self.deadline());
+        }
+        if now >= task.next && task.attempts > 0 && builtin == BuiltinState::Awake {
             self.cancel();
             return Ok(None);
         }
@@ -75,12 +102,9 @@ impl Recovery {
             let error = task
                 .last_error
                 .take()
-                .unwrap_or_else(|| "内建屏未在 5 秒内恢复".into());
+                .unwrap_or_else(|| "未在 5 秒内确认内建屏恢复".into());
             self.cancel();
             return Err(error);
-        }
-        if now < task.next {
-            return Ok(self.deadline());
         }
         let permanent = task.reason != Reason::Angle || task.attempts >= 3;
         if let Err(error) = enable(permanent) {
@@ -98,21 +122,65 @@ mod tests {
     use super::*;
 
     #[test]
+    fn deferred_callback_cannot_confirm_transient_active_state() {
+        let now = Instant::now();
+        let mut recovery = Recovery::default();
+        recovery.request(Reason::Unplug, now);
+        recovery.step(now, BuiltinState::Off, |_| Ok(())).unwrap();
+        recovery.defer(now + Duration::from_millis(700));
+        assert_eq!(
+            recovery.step(
+                now + Duration::from_millis(300),
+                BuiltinState::Awake,
+                |_| panic!("unsettled display")
+            ),
+            Ok(Some(now + Duration::from_millis(700)))
+        );
+        assert_eq!(recovery.reason(), Some(Reason::Unplug));
+        // The apparent activation was rolled back. Recovery must still retry.
+        let mut requests = 0;
+        recovery
+            .step(now + Duration::from_millis(700), BuiltinState::Off, |_| {
+                requests += 1;
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(requests, 1);
+    }
+
+    #[test]
+    fn sleeping_builtin_cancels_every_recovery_purpose_without_configuration() {
+        let now = Instant::now();
+        for reason in [Reason::Unplug, Reason::Angle, Reason::Manual, Reason::Quit] {
+            let mut recovery = Recovery::default();
+            recovery.request(reason, now);
+            assert_eq!(
+                recovery.step(now, BuiltinState::Asleep, |_| panic!("sleeping panel")),
+                Ok(None)
+            );
+            assert_eq!(recovery.deadline(), None);
+        }
+    }
+
+    #[test]
     fn cancellation_prevents_stale_retry_and_new_request_gets_fresh_window() {
         let now = Instant::now();
         let mut recovery = Recovery::default();
         recovery.request(Reason::Unplug, now);
-        recovery.step(now, false, |_| Ok(())).unwrap();
+        recovery.step(now, BuiltinState::Off, |_| Ok(())).unwrap();
         recovery.cancel(); // sleep, manual override, or reconnected monitor
         assert_eq!(
-            recovery.step(now + Duration::from_secs(1), false, |_| panic!(
+            recovery.step(now + Duration::from_secs(1), BuiltinState::Off, |_| panic!(
                 "stale request"
             )),
             Ok(None)
         );
         let wake = now + Duration::from_secs(3600);
         recovery.request(Reason::Unplug, wake);
-        assert!(recovery.step(wake, false, |_| Ok(())).unwrap().is_some());
+        assert!(recovery
+            .step(wake, BuiltinState::Off, |_| Ok(()))
+            .unwrap()
+            .is_some());
     }
 
     #[test]
@@ -120,17 +188,19 @@ mod tests {
         let now = Instant::now();
         let mut recovery = Recovery::default();
         recovery.request(Reason::Unplug, now);
-        recovery.step(now, true, |_| Ok(())).unwrap();
+        recovery.step(now, BuiltinState::Awake, |_| Ok(())).unwrap();
         recovery.defer(now + Duration::from_millis(700));
         recovery.request(Reason::Unplug, now + Duration::from_secs(1));
         assert_eq!(
-            recovery.step(now + Duration::from_millis(300), false, |_| panic!(
-                "unsettled display"
-            )),
+            recovery.step(
+                now + Duration::from_millis(300),
+                BuiltinState::Off,
+                |_| panic!("unsettled display")
+            ),
             Ok(Some(now + Duration::from_millis(700)))
         );
         assert!(recovery
-            .step(now + Duration::from_secs(5), false, |_| panic!(
+            .step(now + Duration::from_secs(5), BuiltinState::Off, |_| panic!(
                 "expired request"
             ))
             .is_err());
@@ -145,17 +215,23 @@ mod tests {
         let mut requests = Vec::new();
         for millis in [0, 300, 600, 900] {
             recovery
-                .step(now + Duration::from_millis(millis), false, |permanent| {
-                    requests.push(permanent);
-                    Ok(())
-                })
+                .step(
+                    now + Duration::from_millis(millis),
+                    BuiltinState::Off,
+                    |permanent| {
+                        requests.push(permanent);
+                        Ok(())
+                    },
+                )
                 .unwrap();
         }
         assert_eq!(requests, [false, false, false, true]);
         assert_eq!(
-            recovery.step(now + Duration::from_millis(1200), true, |_| panic!(
-                "already online"
-            )),
+            recovery.step(
+                now + Duration::from_millis(1200),
+                BuiltinState::Awake,
+                |_| panic!("already online")
+            ),
             Ok(None)
         );
     }

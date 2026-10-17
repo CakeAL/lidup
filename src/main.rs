@@ -28,6 +28,7 @@ use tray_icon::menu::{CheckMenuItem, Menu, MenuItem, PredefinedMenuItem, Submenu
 use tray_icon::TrayIcon;
 
 /// The window/frame state pushed from the worker thread to the event loop.
+#[derive(Debug)]
 struct Snapshot {
     displays: Vec<DisplayInfo>,
     bound: Option<String>,
@@ -51,8 +52,8 @@ enum WorkerEvent {
     SetBound(Option<String>),
     SetAngleThreshold(Option<u16>),
     SampleAngle,
-    /// Enable (`true`) / disable (`false`) launch-at-login. `None` = no change.
-    SetLaunchAtLogin(Option<bool>),
+    /// Enable or disable launch-at-login.
+    SetLaunchAtLogin(bool),
     /// NSWorkspace reports that the Mac or its displays are sleeping/waking.
     PowerSleep,
     PowerWake {
@@ -215,7 +216,7 @@ fn snapshot(
     })
 }
 
-fn needs_builtin_restore(
+const fn needs_builtin_restore(
     builtin_on: bool,
     another_external_on: bool,
     restore_builtin: bool,
@@ -238,7 +239,7 @@ struct WakeGuard {
 }
 
 impl WakeGuard {
-    fn sleep(&mut self) {
+    const fn sleep(&mut self) {
         self.sleeping = true;
         self.suppress_auto_off = true;
         self.grace_until = None;
@@ -293,6 +294,23 @@ struct AutoState {
     trace_requested: bool,
 }
 
+fn advance_builtin_recovery(
+    proxy: &winit::event_loop::EventLoopProxy<UserEvent>,
+    settings: &Settings,
+    recovery: &mut recovery::Recovery,
+    builtin: Option<&DisplayInfo>,
+) -> Option<Instant> {
+    match recovery.step(Instant::now(), builtin.into(), |permanent| {
+        displays::enable_builtin_once(settings.builtin_id, permanent)
+    }) {
+        Ok(next) => next,
+        Err(error) => {
+            report_result(proxy, "恢复内建屏", Err(error));
+            None
+        }
+    }
+}
+
 /// Re-evaluate the current display situation and publish a fresh snapshot.
 ///
 /// A bound monitor must remain absent for five seconds before the built-in is
@@ -333,14 +351,12 @@ fn refresh(
         if std::mem::take(trace_requested) {
             diagnostics::record(&format!("display snapshot {list:?}"));
         }
-        let retry = builtin_recovery.step(
-            Instant::now(),
-            list.iter().any(|d| d.builtin && d.on),
-            |permanent| displays::enable_builtin_once(settings.builtin_id, permanent),
+        let retry = advance_builtin_recovery(
+            proxy,
+            settings,
+            builtin_recovery,
+            list.iter().find(|d| d.builtin),
         );
-        if let Err(error) = &retry {
-            report_result(proxy, "恢复内建屏", Err(error.clone()));
-        }
         *missing_since = None;
         *bound_was_present = false;
         wake_guard.reset();
@@ -350,7 +366,7 @@ fn refresh(
             current_angle,
             angle_available,
         )));
-        return retry.unwrap_or(None);
+        return retry;
     }
 
     let before_id = settings.builtin_id;
@@ -360,16 +376,19 @@ fn refresh(
     if std::mem::take(trace_requested) {
         diagnostics::record(&format!("display snapshot {displays_now:?}"));
     }
-    if let Some(b) = displays_now.iter().find(|d| d.builtin) {
+    let builtin = displays_now.iter().find(|d| d.builtin);
+    let builtin_on = builtin.is_some_and(|d| d.on);
+    let builtin_asleep = builtin.is_some_and(|d| d.asleep);
+    if let Some(b) = builtin {
         settings.builtin_id = Some(b.id);
         settings.builtin_key = Some(b.key.clone());
     }
-    let bound_present = displays_now
+    let bound = displays_now
         .iter()
-        .any(|d| !d.builtin && Some(d.key.as_str()) == settings.bound_key.as_deref());
-    *bound_ready = displays_now.iter().any(|d| {
-        !d.builtin && d.on && !d.asleep && Some(d.key.as_str()) == settings.bound_key.as_deref()
-    });
+        .find(|d| !d.builtin && Some(d.key.as_str()) == settings.bound_key.as_deref());
+    let bound_present = bound.is_some();
+    let external = bound.filter(|d| d.on && !d.asleep);
+    *bound_ready = external.is_some();
     wake_guard.observe_bound(bound_present, Instant::now());
     let mut retry_at = None;
     if bound_present {
@@ -378,12 +397,6 @@ fn refresh(
         if builtin_recovery.reason() == Some(recovery::Reason::Unplug) {
             builtin_recovery.cancel();
         }
-        let external = displays_now
-            .iter()
-            .find(|d| !d.builtin && Some(d.key.as_str()) == settings.bound_key.as_deref())
-            .filter(|d| d.on && !d.asleep);
-        let builtin_on = displays_now.iter().any(|d| d.builtin && d.on);
-        let builtin_asleep = displays_now.iter().any(|d| d.builtin && d.asleep);
         let angle_rule = settings.open_above_angle.is_some();
         let wants_on = angle_rule
             && external.is_some()
@@ -448,8 +461,6 @@ fn refresh(
         // Only an online built-in has a trustworthy sleep state. A display
         // disabled by this app is absent from the online list and querying its
         // cached id can report "asleep" even after a real cable unplug.
-        let builtin_asleep = displays_now.iter().any(|d| d.builtin && d.asleep);
-        let builtin_on = displays_now.iter().any(|d| d.builtin && d.on);
         let another_external_on = displays_now.iter().any(|d| !d.builtin && d.on);
         // CoreGraphics can report the built-in as active while its panel is
         // still dark after unplug. Keep the old transition-based forced restore.
@@ -479,20 +490,8 @@ fn refresh(
         }
     }
 
-    if displays_now.iter().any(|d| d.builtin && d.asleep) {
-        builtin_recovery.cancel();
-    }
-    let recovery_retry = builtin_recovery.step(
-        Instant::now(),
-        displays_now.iter().any(|d| d.builtin && d.on),
-        |permanent| displays::enable_builtin_once(settings.builtin_id, permanent),
-    );
-    match recovery_retry {
-        Ok(Some(at)) => retry_at = Some(retry_at.map_or(at, |other| other.min(at))),
-        Err(error) => {
-            report_result(proxy, "恢复内建屏", Err(error));
-        }
-        _ => {}
+    if let Some(at) = advance_builtin_recovery(proxy, settings, builtin_recovery, builtin) {
+        retry_at = Some(retry_at.map_or(at, |other| other.min(at)));
     }
 
     if settings.builtin_id != before_id || settings.builtin_key != before_key {
@@ -510,7 +509,7 @@ fn refresh(
     Some(retry_at.map_or(watchdog, |at| at.min(watchdog)))
 }
 
-fn should_track_angle(settings: &Settings, state: &AutoState) -> bool {
+const fn should_track_angle(settings: &Settings, state: &AutoState) -> bool {
     settings.bound_key.is_some()
         && settings.open_above_angle.is_some()
         && state.bound_ready
@@ -555,11 +554,10 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
             (Some(a), None) | (None, Some(a)) => Some(a),
             (None, None) => None,
         };
-        let event = if let Some(deadline) = deadline {
-            rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
-        } else {
-            rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected)
-        };
+        let event = deadline.map_or_else(
+            || rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
+            |deadline| rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
+        );
         match event {
             Ok(ev) => {
                 match ev {
@@ -680,26 +678,24 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         }
                     }
                     WorkerEvent::SetLaunchAtLogin(enabled) => {
-                        if let Some(enabled) = enabled {
-                            let result = if enabled {
-                                launch::register()
-                            } else {
-                                launch::unregister()
-                            };
-                            if report_result(
-                                &proxy,
-                                "设置登录项",
-                                result.map_err(|error| error.to_string()),
-                            ) {
-                                settings.launch_at_login = launch::check_reg_status();
-                                report_result(&proxy, "保存配置", settings.save());
-                                if enabled && !settings.launch_at_login {
-                                    report_result(
-                                        &proxy,
-                                        "启用登录项",
-                                        Err("请在系统设置 → 通用 → 登录项中批准 lidup".into()),
-                                    );
-                                }
+                        let result = if enabled {
+                            launch::register()
+                        } else {
+                            launch::unregister()
+                        };
+                        if report_result(
+                            &proxy,
+                            "设置登录项",
+                            result.map_err(|error| error.to_string()),
+                        ) {
+                            settings.launch_at_login = launch::check_reg_status();
+                            report_result(&proxy, "保存配置", settings.save());
+                            if enabled && !settings.launch_at_login {
+                                report_result(
+                                    &proxy,
+                                    "启用登录项",
+                                    Err("请在系统设置 → 通用 → 登录项中批准 lidup".into()),
+                                );
                             }
                         }
                     }
@@ -806,13 +802,13 @@ fn auto_summary(snap: &Snapshot) -> String {
     {
         return "自动关闭内建屏：唤醒后暂停（保护 HDR）".into();
     }
-    match snap.bound.as_deref() {
-        None => "自动关闭内建屏：未启用".into(),
-        Some(key) => match snap.displays.iter().find(|d| d.key == key) {
-            Some(display) => format!("自动关闭内建屏：{}", display.name),
-            None => "自动关闭内建屏：等待已绑定显示器".into(),
-        },
-    }
+    let Some(key) = snap.bound.as_deref() else {
+        return "自动关闭内建屏：未启用".into();
+    };
+    snap.displays.iter().find(|d| d.key == key).map_or_else(
+        || "自动关闭内建屏：等待已绑定显示器".into(),
+        |display| format!("自动关闭内建屏：{}", display.name),
+    )
 }
 
 fn angle_summary(snap: &Snapshot) -> String {
@@ -824,6 +820,10 @@ fn angle_summary(snap: &Snapshot) -> String {
         (Some(angle), None) => format!("当前开合角：{angle}°"),
         (None, _) => "正在读取开合角…".into(),
     }
+}
+
+fn notice_label(text: Option<&str>) -> String {
+    text.map_or_else(|| "最近操作：无提示".into(), short_error)
 }
 
 /// The set of menu items currently shown. **Structural identity** (which displays
@@ -852,7 +852,7 @@ struct MenuState {
 }
 
 impl MenuState {
-    fn build(snap: &Snapshot, update: &UpdateStatus, notice_text: Option<&str>) -> MenuState {
+    fn build(snap: &Snapshot, update: &UpdateStatus, notice_text: Option<&str>) -> Self {
         let menu = Menu::new();
 
         let title = MenuItem::with_id(
@@ -967,9 +967,7 @@ impl MenuState {
         let _ = menu.append(&PredefinedMenuItem::separator());
         let notice = MenuItem::with_id(
             "notice",
-            notice_text
-                .map(short_error)
-                .unwrap_or_else(|| "最近操作：无提示".into()),
+            notice_label(notice_text),
             notice_text.is_some(),
             None,
         );
@@ -983,7 +981,7 @@ impl MenuState {
         let quit = MenuItem::with_id("quit", "退出 lidup", true, None);
         let _ = menu.append(&quit);
 
-        MenuState {
+        Self {
             menu,
             auto_summary,
             bind_none,
@@ -1034,10 +1032,7 @@ impl MenuState {
     }
 
     fn set_notice(&self, text: Option<&str>) {
-        self.notice.set_text(
-            text.map(short_error)
-                .unwrap_or_else(|| "最近操作：无提示".into()),
-        );
+        self.notice.set_text(notice_label(text));
         self.notice.set_enabled(text.is_some());
     }
 
@@ -1180,12 +1175,10 @@ impl ApplicationHandler<UserEvent> for App {
                 } else if id == "export-diagnostics" {
                     match choose_diagnostic_path() {
                         Ok(Some(path)) => {
-                            let mut context = format!("latest_notice={:?}\n", self.notice);
-                            if let Some(snap) = &self.snapshot {
-                                context.push_str(&format!("bound={:?} threshold={:?} angle={:?} sensor_available={} auto_off_suppressed={} control_available={} login_enabled={}\ndisplays={:#?}\n",
-                                    snap.bound, snap.open_above_angle, snap.current_angle, snap.angle_available,
-                                    snap.auto_off_suppressed, snap.control_ok, snap.launch_at_login, snap.displays));
-                            }
+                            let context = format!(
+                                "latest_notice={:?}\nsnapshot={:#?}\n",
+                                self.notice, self.snapshot
+                            );
                             let proxy = self.proxy.clone();
                             std::thread::spawn(move || {
                                 let message = match diagnostics::export(&path, &context) {
@@ -1244,9 +1237,7 @@ impl ApplicationHandler<UserEvent> for App {
                         .as_ref()
                         .map(|s| s.launch_at_login)
                         .unwrap_or(false);
-                    let _ = self
-                        .cmd_tx
-                        .send(WorkerEvent::SetLaunchAtLogin(Some(!enabled)));
+                    let _ = self.cmd_tx.send(WorkerEvent::SetLaunchAtLogin(!enabled));
                 } else if let Some(key) = id.as_ref().strip_prefix("bind:") {
                     let key = if key == "none" {
                         None
@@ -1342,7 +1333,7 @@ fn quad_contains(x: f64, y: f64, quad: &[(f64, f64); 4]) -> bool {
     for index in 0..4 {
         let (ax, ay) = quad[index];
         let (bx, by) = quad[(index + 1) % 4];
-        let cross = (bx - ax) * (y - ay) - (by - ay) * (x - ax);
+        let cross = (bx - ax).mul_add(y - ay, -((by - ay) * (x - ax)));
         positive |= cross > 0.0;
         negative |= cross < 0.0;
         if positive && negative {
