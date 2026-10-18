@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "lidup"
-version = "0.1.4"
+version = "0.1.5"
 dependencies = [
  "anyhow",
  "block2 0.6.2",

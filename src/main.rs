@@ -175,7 +175,9 @@ fn snapshot(
     current_angle: Option<u16>,
     angle_available: bool,
 ) -> Box<Snapshot> {
-    let mut list = displays::online_displays();
+    // Manual controls must retain software-disabled externals too, even after
+    // an app restart. Auto rules and unplug detection still use the online list.
+    let mut list = displays::known_displays().unwrap_or_else(|_| displays::online_displays());
     // A powered-off built-in leaves the online list; re-add it so the user can
     // always toggle it back on from the menu. It must use the built-in's *stable*
     // key (not a synthetic one) so the menu's structural signature doesn't change
@@ -843,12 +845,27 @@ fn dims(d: &DisplayInfo) -> String {
     }
 }
 
-fn toggle_label(d: &DisplayInfo) -> String {
+fn toggle_label(d: &DisplayInfo, list: &[DisplayInfo]) -> String {
+    let id_hint = if list
+        .iter()
+        .any(|other| other.id != d.id && other.key == d.key)
+    {
+        format!(" · ID {}", d.id)
+    } else {
+        String::new()
+    };
     format!(
-        "{}{}  ·  {}",
+        "{}{}{}  ·  {}",
         d.name,
         dims(d),
-        if d.on { "已开启" } else { "已关闭" }
+        id_hint,
+        if d.on {
+            "已开启"
+        } else if d.builtin {
+            "已关闭"
+        } else {
+            "已关闭或未连接 · 点击开启"
+        }
     )
 }
 
@@ -929,7 +946,7 @@ impl MenuState {
         for d in &snap.displays {
             let item = CheckMenuItem::with_id(
                 "toggle:".to_string() + &d.id.to_string(),
-                toggle_label(d),
+                toggle_label(d, &snap.displays),
                 true,
                 d.on,
                 None,
@@ -949,7 +966,9 @@ impl MenuState {
         let _ = bind.append(&bind_none);
         let mut bind_items = Vec::new();
         for d in &snap.displays {
-            if d.builtin {
+            // WindowServer can remember several runtime IDs for the same stable
+            // identity (for example after changing ports). Bind only once per key.
+            if d.builtin || bind_items.iter().any(|(key, _)| key == &d.key) {
                 continue;
             }
             let item = CheckMenuItem::with_id(
@@ -1078,9 +1097,9 @@ impl MenuState {
         }
         for (id, item) in &self.toggle_items {
             if let Some(d) = snap.displays.iter().find(|d| d.id == *id) {
-                if item.is_checked() != d.on || item.text() != toggle_label(d) {
+                if item.is_checked() != d.on || item.text() != toggle_label(d, &snap.displays) {
                     item.set_checked(d.on);
-                    item.set_text(toggle_label(d));
+                    item.set_text(toggle_label(d, &snap.displays));
                 }
             }
         }
@@ -1107,7 +1126,8 @@ impl MenuState {
 }
 
 /// Stable identity of the display list: the ordered set of display ids + keys.
-/// When this changes, a display was truly plugged in / unplugged. The bound
+/// Includes known offline displays so manually disabling one does not remove its
+/// menu entry and trigger a rebuild while the menu is open. The bound
 /// selection is *not* part of it (rebinding only flips a checkmark, handled in place).
 fn structural_signature(snap: &Snapshot) -> String {
     let mut s = String::new();
@@ -1559,6 +1579,44 @@ mod worker_tests {
         needs_builtin_restore, observe_power_events, should_track_angle, AutoState, Settings,
         WakeGuard, WorkerEvent,
     };
+
+    #[test]
+    fn disabled_external_keeps_menu_identity_and_can_be_distinguished_from_old_port() {
+        let mut external = super::DisplayInfo {
+            id: 3,
+            builtin: false,
+            on: true,
+            asleep: false,
+            width: 1920,
+            height: 1080,
+            name: "External Display".into(),
+            key: "external".into(),
+        };
+        let mut old_port = external.clone();
+        old_port.id = 2;
+        old_port.on = false;
+        let mut snap = super::Snapshot {
+            displays: vec![old_port, external.clone()],
+            bound: None,
+            open_above_angle: None,
+            current_angle: None,
+            angle_available: false,
+            auto_off_suppressed: false,
+            control_ok: true,
+            launch_at_login: false,
+        };
+        let before = super::structural_signature(&snap);
+        external.on = false;
+        snap.displays[1] = external.clone();
+        assert_eq!(before, super::structural_signature(&snap));
+        let label = super::toggle_label(&external, &snap.displays);
+        assert!(label.contains("点击开启"));
+        assert!(label.contains("ID 3"));
+        assert_ne!(
+            label,
+            super::toggle_label(&snap.displays[0], &snap.displays)
+        );
+    }
 
     #[test]
     fn bound_removal_uses_two_snapshots_within_one_second() {

@@ -76,6 +76,7 @@ pub struct DisplayInfo {
 static SKYLIGHT: OnceLock<Option<Library>> = OnceLock::new();
 
 type SetEnabledFn = unsafe extern "C" fn(CGDisplayConfigRef, u32, bool) -> CGError;
+type GetDisplayListFn = unsafe extern "C" fn(u32, *mut DisplayID, *mut u32) -> CGError;
 
 fn sky_library() -> Option<&'static Library> {
     SKYLIGHT
@@ -112,6 +113,55 @@ pub fn online_displays() -> Vec<DisplayInfo> {
         ids.truncate(count as usize);
         ids.into_iter().map(describe).collect()
     }
+}
+
+/// WindowServer's known displays, including software-disabled displays that are
+/// absent from the public online list. Use only for manual controls: an offline
+/// entry is not evidence that a cable is connected or a screen is usable.
+pub fn known_displays() -> Result<Vec<DisplayInfo>, String> {
+    let lib = sky_library().ok_or("private display enumeration unavailable")?;
+    let get = unsafe {
+        *lib.get::<GetDisplayListFn>(b"CGSGetDisplayList\0")
+            .map_err(|_| "private display enumeration unavailable")?
+    };
+    let ids = known_display_ids(|capacity, ids, count| unsafe { get(capacity, ids, count) })?;
+    Ok(merge_displays(
+        online_displays(),
+        ids.into_iter().map(describe).collect(),
+    ))
+}
+
+fn known_display_ids(
+    mut get: impl FnMut(u32, *mut DisplayID, *mut u32) -> CGError,
+) -> Result<Vec<DisplayID>, String> {
+    let mut ids = vec![0; 16];
+    loop {
+        let mut count = 0;
+        let error = get(ids.len() as u32, ids.as_mut_ptr(), &mut count);
+        if error != 0 {
+            return Err(format!("CGSGetDisplayList failed ({error})"));
+        }
+        if (count as usize) < ids.len() {
+            ids.truncate(count as usize);
+            ids.retain(|id| *id != 0);
+            ids.sort_unstable();
+            ids.dedup();
+            return Ok(ids);
+        }
+        if ids.len() >= 1024 {
+            return Err("CGSGetDisplayList returned too many displays".into());
+        }
+        ids.resize((ids.len() * 2).max(count as usize).min(1024), 0);
+    }
+}
+
+fn merge_displays(mut online: Vec<DisplayInfo>, known: Vec<DisplayInfo>) -> Vec<DisplayInfo> {
+    for display in known {
+        if !online.iter().any(|current| current.id == display.id) {
+            online.push(display);
+        }
+    }
+    online
 }
 
 fn describe(id: DisplayID) -> DisplayInfo {
@@ -179,6 +229,14 @@ fn configure_enabled(id: DisplayID, enabled: bool) -> Result<(), String> {
 /// which is more reliably accepted when re-enabling a display that was disabled and
 /// then the hardware set changed (e.g. right after an external was unplugged).
 fn configure_enabled_with(id: DisplayID, enabled: bool, permanent: bool) -> Result<(), String> {
+    if !enabled {
+        // Every disable path (manual and automatic) must pass this fresh check.
+        // A sleeping or software-disabled screen cannot serve as the fallback.
+        let list = online_displays();
+        if !can_disable(id, &list) {
+            return Err("必须保留至少一块已开启且未睡眠的显示器".into());
+        }
+    }
     let set = set_enabled_fn().ok_or_else(|| "private display control unavailable".to_string())?;
     crate::diagnostics::record(&format!(
         "display configure id={id} enabled={enabled} permanent={permanent}"
@@ -272,7 +330,15 @@ pub fn register_reconfig_handler<F: Fn(DisplayChange) + Send + Sync + 'static>(
 
 /// Number of displays that are currently on (enabled/lit).
 pub fn active_count() -> usize {
-    online_displays().iter().filter(|d| d.on).count()
+    online_displays()
+        .iter()
+        .filter(|d| d.on && !d.asleep)
+        .count()
+}
+
+fn can_disable(id: DisplayID, list: &[DisplayInfo]) -> bool {
+    list.iter().any(|d| d.id == id && d.on && !d.asleep)
+        && list.iter().any(|d| d.id != id && d.on && !d.asleep)
 }
 
 /// Whether turning a display off would leave at least one other display on.
@@ -283,10 +349,17 @@ pub fn is_last_active(id: DisplayID) -> bool {
 
 /// Toggle a display on/off, but refuse to turn off the last lit display.
 pub fn toggle_safe(id: DisplayID) -> Result<(), String> {
-    if is_on(id) && is_last_active(id) {
-        return Err("refusing to turn off the last active display".to_string());
+    // Re-enumerate immediately before a manual operation, including when turning
+    // a display back on. A stale menu or a cached ID alone is not sufficient.
+    let list = known_displays()?;
+    let display = list
+        .iter()
+        .find(|display| display.id == id)
+        .ok_or("显示器状态已变化，请重新打开菜单")?;
+    if display.asleep {
+        return Err("显示器正在睡眠，请唤醒后重试".into());
     }
-    set_enabled(id, !is_on(id))
+    set_enabled(id, !display.on)
 }
 
 fn find_builtin_id(cached_id: Option<DisplayID>) -> Option<DisplayID> {
@@ -308,6 +381,82 @@ pub fn enable_builtin_once(cached_id: Option<DisplayID>, permanent: bool) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn display(id: DisplayID, on: bool, asleep: bool) -> DisplayInfo {
+        DisplayInfo {
+            id,
+            builtin: id == 1,
+            on,
+            asleep,
+            width: 1920,
+            height: 1080,
+            name: format!("display {id}"),
+            key: format!("key:{id}"),
+        }
+    }
+
+    #[test]
+    fn every_disable_requires_another_awake_display() {
+        let target = display(3, true, false);
+        assert!(!can_disable(3, &[]));
+        assert!(!can_disable(3, std::slice::from_ref(&target)));
+        assert!(!can_disable(3, &[target.clone(), display(1, false, false)]));
+        assert!(!can_disable(3, &[target.clone(), display(1, true, true)]));
+        assert!(can_disable(3, &[target.clone(), display(1, true, false)]));
+        assert!(!can_disable(99, &[target, display(1, true, false)]));
+        // A closed/asleep laptop may never be disabled as part of a wake race.
+        assert!(!can_disable(
+            1,
+            &[display(1, true, true), display(3, true, false)]
+        ));
+    }
+
+    #[test]
+    fn offline_external_remains_recoverable_after_public_list_loses_it() {
+        let before = merge_displays(
+            vec![display(1, true, false), display(3, true, false)],
+            vec![display(1, true, false), display(3, true, false)],
+        );
+        // Reconstruct from WindowServer, without an in-memory/settings cache,
+        // exactly as after restarting the app with the external disabled.
+        let after = merge_displays(
+            vec![display(1, true, false)],
+            vec![display(1, true, false), display(3, false, false)],
+        );
+        assert_eq!(before.iter().map(|d| d.id).collect::<Vec<_>>(), vec![1, 3]);
+        assert_eq!(after.iter().map(|d| d.id).collect::<Vec<_>>(), vec![1, 3]);
+        assert!(!after[1].on);
+        // Offline entries are for controls only, never for last-screen safety.
+        assert!(!can_disable(1, &after));
+    }
+
+    #[test]
+    fn online_observation_wins_over_stale_private_enumeration() {
+        let list = merge_displays(
+            vec![display(3, true, false)],
+            vec![display(3, false, false), display(2, false, false)],
+        );
+        assert_eq!(list.len(), 2);
+        assert!(list[0].on);
+    }
+
+    #[test]
+    fn private_enumeration_grows_without_silently_losing_offline_ids() {
+        let mut calls = 0;
+        let ids = known_display_ids(|capacity, ids, count| {
+            calls += 1;
+            let len = capacity.min(19);
+            for i in 0..len {
+                unsafe { ids.add(i as usize).write(i + 1) };
+            }
+            unsafe { count.write(len) };
+            0
+        })
+        .unwrap();
+        assert_eq!(calls, 2);
+        assert_eq!(ids, (1..=19).collect::<Vec<_>>());
+        assert!(known_display_ids(|_, _, _| 1001).is_err());
+    }
 
     #[test]
     fn only_completed_callbacks_expose_removal_evidence() {
