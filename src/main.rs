@@ -34,7 +34,8 @@ struct Snapshot {
     bound: Option<String>,
     open_above_angle: Option<u16>,
     current_angle: Option<u16>,
-    angle_available: bool,
+    /// None means no read has been attempted, not an unsupported sensor.
+    angle_available: Option<bool>,
     auto_off_suppressed: bool,
     control_ok: bool,
     /// Whether launching at login is currently enabled.
@@ -69,7 +70,6 @@ enum UserEvent {
     UpdateInstalling(String),
     UpdateInstalled(Result<String, String>),
     Menu(tray_icon::menu::MenuEvent),
-    Tray,
     Notice(String),
     Exit,
 }
@@ -173,7 +173,7 @@ fn snapshot(
     settings: &Settings,
     auto_off_suppressed: bool,
     current_angle: Option<u16>,
-    angle_available: bool,
+    angle_available: Option<bool>,
 ) -> Box<Snapshot> {
     // Manual controls must retain software-disabled externals too, even after
     // an app restart. Auto rules and unplug detection still use the online list.
@@ -367,7 +367,7 @@ fn refresh(
     settings: &mut Settings,
     state: &mut AutoState,
     current_angle: Option<u16>,
-    angle_available: bool,
+    angle_available: Option<bool>,
     angle_intent: Option<bool>,
     angle_last_action: &mut Option<(bool, Instant)>,
 ) -> Option<Instant> {
@@ -573,6 +573,19 @@ const fn should_track_angle(settings: &Settings, state: &AutoState) -> bool {
         && !state.quitting
 }
 
+fn take_angle_probe(
+    requested: &mut bool,
+    sleeping: bool,
+    refresh_at: Option<Instant>,
+    now: Instant,
+) -> bool {
+    if !sleeping && refresh_at.is_some_and(|due| now >= due) {
+        std::mem::take(requested)
+    } else {
+        false
+    }
+}
+
 fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receiver<WorkerEvent>) {
     let (mut settings, config_loaded) = match Settings::load_checked() {
         Ok(settings) => (settings, true),
@@ -598,7 +611,10 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
     angle_gate.configure(settings.open_above_angle);
     let mut current_angle = None;
     let mut next_angle_poll = None;
-    let mut angle_available = false;
+    let mut angle_available = None;
+    // A one-shot probe establishes capability even when automatic control is
+    // disabled. Display callbacks may defer it, but must not cancel it.
+    let mut angle_probe_requested = true;
     let mut last_angle_snapshot = Instant::now() - Duration::from_secs(2);
     let mut angle_last_action = None;
 
@@ -656,6 +672,8 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         auto_state.wake_guard.sleep();
                         angle_reader.reset();
                         current_angle = None;
+                        angle_available = None;
+                        angle_probe_requested = false;
                         next_angle_poll = None;
                         pending_refresh = None;
                         continue;
@@ -683,6 +701,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                             auto_state.hdr_recovery.restore_pending()
                         ));
                         auto_state.unplug.reset();
+                        angle_probe_requested = true;
                         pending_refresh = Some(
                             now + if screens_ready {
                                 Duration::from_millis(200)
@@ -705,6 +724,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         }
                     }
                     WorkerEvent::SetBound(key) => {
+                        angle_probe_requested = true;
                         auto_state.unplug.reset();
                         auto_state.builtin_recovery.cancel();
                         auto_state.wake_guard.reset();
@@ -724,6 +744,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         }
                     }
                     WorkerEvent::SetAngleThreshold(threshold) => {
+                        angle_probe_requested = true;
                         auto_state.builtin_recovery.cancel();
                         settings.open_above_angle = threshold;
                         report_result(&proxy, "保存配置", settings.save());
@@ -733,8 +754,12 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                     }
                     WorkerEvent::SampleAngle => {
                         if !auto_state.wake_guard.sleeping {
-                            next_angle_poll = Some(Instant::now());
+                            angle_probe_requested = true;
+                            pending_refresh.get_or_insert_with(Instant::now);
                         }
+                        // Opening the menu must not bypass the topology's
+                        // existing settle deadline or start continuous polling.
+                        continue;
                     }
                     WorkerEvent::SetLaunchAtLogin(enabled) => {
                         let result = if enabled {
@@ -759,6 +784,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         }
                     }
                     WorkerEvent::Quit => {
+                        angle_probe_requested = false;
                         // Restore the built-in display so the user isn't left dark.
                         if auto_state.wake_guard.sleeping {
                             let _ = proxy.send_event(UserEvent::Exit);
@@ -777,17 +803,31 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
         }
 
         let now = Instant::now();
+        if take_angle_probe(
+            &mut angle_probe_requested,
+            auto_state.wake_guard.sleeping,
+            pending_refresh,
+            now,
+        ) {
+            next_angle_poll = Some(now);
+        }
         if next_angle_poll.is_some_and(|due| now >= due) {
             let previous_angle = current_angle;
             let previous_available = angle_available;
             current_angle = angle_reader.sample(now);
-            angle_available = angle_reader.available();
+            angle_available = Some(angle_reader.available());
+            if angle_available != previous_available {
+                diagnostics::record(&format!(
+                    "hinge sensor available={} angle={current_angle:?}",
+                    angle_available == Some(true)
+                ));
+            }
             angle_gate.configure(settings.open_above_angle);
             let crossed = angle_gate.observe(current_angle, now);
             let interval = lid_angle::poll_interval(
                 should_track_angle(&settings, &auto_state),
                 angle_gate.settling(),
-                angle_available,
+                angle_available == Some(true),
             );
             next_angle_poll = interval.map(|interval| now + interval);
             if interval.is_none() {
@@ -886,8 +926,10 @@ fn auto_summary(snap: &Snapshot) -> String {
 }
 
 fn angle_summary(snap: &Snapshot) -> String {
-    if !snap.angle_available {
-        return "开合角传感器不可用".into();
+    match snap.angle_available {
+        None => return "尚未检测开合角 · 点击检测".into(),
+        Some(false) => return "暂时无法读取开合角 · 点击重试".into(),
+        Some(true) => {}
     }
     match (snap.current_angle, snap.open_above_angle) {
         (Some(angle), Some(limit)) => format!("当前 {angle}° · 大于 {limit}° 点亮内建屏"),
@@ -983,7 +1025,7 @@ impl MenuState {
         }
         let _ = menu.append(&bind);
         let angle = Submenu::new("开合角控制", true);
-        let angle_status = MenuItem::with_id("angle-status", angle_summary(snap), false, None);
+        let angle_status = MenuItem::with_id("angle-status", angle_summary(snap), true, None);
         let _ = angle.append(&angle_status);
         let _ = angle.append(&PredefinedMenuItem::separator());
         let angle_none = CheckMenuItem::with_id(
@@ -1001,7 +1043,7 @@ impl MenuState {
                 let item = CheckMenuItem::with_id(
                     format!("angle:{threshold}"),
                     format!("大于 {threshold}° 时点亮"),
-                    snap.angle_available,
+                    snap.angle_available != Some(false),
                     snap.open_above_angle == Some(threshold),
                     None,
                 );
@@ -1093,7 +1135,7 @@ impl MenuState {
         self.angle_none.set_checked(snap.open_above_angle.is_none());
         for (threshold, item) in &self.angle_items {
             item.set_checked(snap.open_above_angle == Some(*threshold));
-            item.set_enabled(snap.angle_available);
+            item.set_enabled(snap.angle_available != Some(false));
         }
         for (id, item) in &self.toggle_items {
             if let Some(d) = snap.displays.iter().find(|d| d.id == *id) {
@@ -1159,7 +1201,7 @@ impl ApplicationHandler<UserEvent> for App {
             // so the first worker-sent snapshot matches and we never rebuild the
             // tray menu right after startup.
             let settings = Settings::load();
-            let snap = *snapshot(&settings, false, None, false);
+            let snap = *snapshot(&settings, false, None, None);
             let ms = MenuState::build(&snap, &self.update_status, self.notice.as_deref());
             let icon = tray_image();
             let tray = tray_icon::TrayIconBuilder::new()
@@ -1322,6 +1364,8 @@ impl ApplicationHandler<UserEvent> for App {
                         Some(key.to_string())
                     };
                     let _ = self.cmd_tx.send(WorkerEvent::SetBound(key));
+                } else if id == "angle-status" {
+                    let _ = self.cmd_tx.send(WorkerEvent::SampleAngle);
                 } else if let Some(value) = id.as_ref().strip_prefix("angle:") {
                     let threshold = if value == "none" {
                         Some(None)
@@ -1336,9 +1380,6 @@ impl ApplicationHandler<UserEvent> for App {
                         let _ = self.cmd_tx.send(WorkerEvent::Toggle(did));
                     }
                 }
-            }
-            UserEvent::Tray => {
-                let _ = self.cmd_tx.send(WorkerEvent::SampleAngle);
             }
             UserEvent::Exit => {
                 event_loop.exit();
@@ -1507,8 +1548,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
+    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerEvent>();
 
-    let tray_proxy = proxy.clone();
+    // Notify the worker directly before Cocoa opens its modal menu. Routing via
+    // winit can postpone the probe until the menu closes.
+    let tray_commands = cmd_tx.clone();
     tray_icon::TrayIconEvent::set_event_handler(Some(move |event| {
         if matches!(
             event,
@@ -1518,7 +1562,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ..
             }
         ) {
-            let _ = tray_proxy.send_event(UserEvent::Tray);
+            let _ = tray_commands.send(WorkerEvent::SampleAngle);
         }
     }));
     let menu_proxy = proxy.clone();
@@ -1527,7 +1571,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }));
 
     // Event-driven worker: wake it on display changes and on manual actions.
-    let (cmd_tx, cmd_rx) = mpsc::channel::<WorkerEvent>();
     let _power_observers = observe_power_events(cmd_tx.clone());
 
     // Fire whenever a display is inserted/removed/powered — forwards to the worker.
@@ -1600,7 +1643,7 @@ mod worker_tests {
             bound: None,
             open_above_angle: None,
             current_angle: None,
-            angle_available: false,
+            angle_available: None,
             auto_off_suppressed: false,
             control_ok: true,
             launch_at_login: false,
@@ -1616,6 +1659,61 @@ mod worker_tests {
             label,
             super::toggle_label(&snap.displays[0], &snap.displays)
         );
+    }
+
+    #[test]
+    fn unprobed_sensor_is_not_reported_as_unavailable() {
+        let mut snap = super::Snapshot {
+            displays: Vec::new(),
+            bound: None,
+            open_above_angle: None,
+            current_angle: None,
+            angle_available: None,
+            auto_off_suppressed: false,
+            control_ok: true,
+            launch_at_login: false,
+        };
+        assert_eq!(super::angle_summary(&snap), "尚未检测开合角 · 点击检测");
+        snap.angle_available = Some(false);
+        assert_eq!(super::angle_summary(&snap), "暂时无法读取开合角 · 点击重试");
+        snap.angle_available = Some(true);
+        snap.current_angle = Some(92);
+        assert_eq!(super::angle_summary(&snap), "当前开合角：92°");
+    }
+
+    #[test]
+    fn startup_probe_survives_display_settling_and_is_consumed_only_once() {
+        let now = Instant::now();
+        let due = now + Duration::from_millis(700);
+        let mut requested = true; // startup, with auto/angle controls disabled
+        assert!(!super::take_angle_probe(
+            &mut requested,
+            false,
+            Some(due),
+            now
+        ));
+        assert!(requested);
+        assert!(!super::take_angle_probe(
+            &mut requested,
+            true,
+            Some(due),
+            due
+        ));
+        assert!(requested);
+        assert!(super::take_angle_probe(
+            &mut requested,
+            false,
+            Some(due),
+            due
+        ));
+        assert!(!super::take_angle_probe(
+            &mut requested,
+            false,
+            Some(due),
+            due
+        ));
+        // No continuing sampling when the one-shot capability check is done.
+        assert_eq!(super::lid_angle::poll_interval(false, false, true), None);
     }
 
     #[test]
