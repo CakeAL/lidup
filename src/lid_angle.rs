@@ -24,6 +24,9 @@ extern "C" {
     fn CFDictionarySetValue(dictionary: HIDRef, key: CFRef, value: CFRef);
     fn CFStringCreateWithCString(allocator: CFRef, string: *const c_char, encoding: u32) -> CFRef;
     fn CFNumberCreate(allocator: CFRef, number_type: isize, value: *const i32) -> CFRef;
+    fn CFGetTypeID(value: CFRef) -> usize;
+    fn CFBooleanGetTypeID() -> usize;
+    fn CFBooleanGetValue(value: CFRef) -> u8;
     fn CFSetGetCount(set: CFRef) -> isize;
     fn CFSetGetValues(set: CFRef, values: *mut CFRef);
     fn CFRetain(value: CFRef) -> CFRef;
@@ -32,6 +35,14 @@ extern "C" {
 
 #[link(name = "IOKit", kind = "framework")]
 extern "C" {
+    fn IORegistryEntryFromPath(main_port: u32, path: *const c_char) -> u32;
+    fn IORegistryEntryCreateCFProperty(
+        entry: u32,
+        key: CFRef,
+        allocator: CFRef,
+        options: u32,
+    ) -> CFRef;
+    fn IOObjectRelease(entry: u32) -> i32;
     fn IOHIDManagerCreate(allocator: CFRef, options: u32) -> HIDRef;
     fn IOHIDManagerOpen(manager: HIDRef, options: u32) -> i32;
     fn IOHIDManagerClose(manager: HIDRef, options: u32) -> i32;
@@ -50,6 +61,33 @@ extern "C" {
 
 const UTF8: u32 = 0x0800_0100;
 const FEATURE_REPORT: i32 = 2;
+
+/// Physical lid state, independent of the angle threshold and display topology.
+pub fn clamshell_closed() -> Option<bool> {
+    unsafe {
+        let entry =
+            IORegistryEntryFromPath(0, c"IOPower:/IOPowerConnection/IOPMrootDomain".as_ptr());
+        if entry == 0 {
+            return None;
+        }
+        let key = CFStringCreateWithCString(ptr::null(), c"AppleClamshellState".as_ptr(), UTF8);
+        let value = if key.is_null() {
+            ptr::null()
+        } else {
+            let value = IORegistryEntryCreateCFProperty(entry, key, ptr::null(), 0);
+            CFRelease(key);
+            value
+        };
+        IOObjectRelease(entry);
+        if value.is_null() {
+            return None;
+        }
+        let closed =
+            (CFGetTypeID(value) == CFBooleanGetTypeID()).then(|| CFBooleanGetValue(value) != 0);
+        CFRelease(value);
+        closed
+    }
+}
 
 struct Sensor {
     manager: HIDRef,

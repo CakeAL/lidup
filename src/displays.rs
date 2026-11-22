@@ -165,7 +165,15 @@ fn merge_displays(mut online: Vec<DisplayInfo>, known: Vec<DisplayInfo>) -> Vec<
 }
 
 fn is_placeholder(on: bool, identity: (u32, u32, u32), size: (u32, u32)) -> bool {
-    !on && identity == (0, 0, 0) && size.0 <= 1 && size.1 <= 1
+    // WindowServer creates an active fallback display when no output is
+    // available. Its vendor/model encode 'unkn' and 'virt'.
+    identity
+        == (
+            u32::from_be_bytes(*b"unkn"),
+            u32::from_be_bytes(*b"virt"),
+            0,
+        )
+        || (!on && identity == (0, 0, 0) && size.0 <= 1 && size.1 <= 1)
 }
 
 fn describe(id: DisplayID) -> Option<DisplayInfo> {
@@ -451,6 +459,11 @@ mod tests {
     fn only_placeholder_signatures_are_excluded() {
         assert!(is_placeholder(false, (0, 0, 0), (1, 1)));
         assert!(is_placeholder(false, (0, 0, 0), (0, 0)));
+        assert!(is_placeholder(
+            true,
+            (0x756e6b6e, 0x76697274, 0),
+            (1920, 1080)
+        ));
         assert!(!is_placeholder(false, (0x4c23, 0x2765, 0), (1, 1)));
         assert!(!is_placeholder(false, (0, 0, 0), (1920, 1080)));
         assert!(!is_placeholder(true, (0, 0, 0), (1, 1)));

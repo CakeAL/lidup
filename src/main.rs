@@ -56,7 +56,9 @@ enum WorkerEvent {
     /// Enable or disable launch-at-login.
     SetLaunchAtLogin(bool),
     /// NSWorkspace reports that the Mac or its displays are sleeping/waking.
-    PowerSleep,
+    PowerSleep {
+        system: bool,
+    },
     PowerWake {
         screens_ready: bool,
     },
@@ -234,6 +236,8 @@ const fn needs_builtin_restore(
 #[derive(Default)]
 struct WakeGuard {
     sleeping: bool,
+    system_sleeping: bool,
+    lid_closed_during_screen_sleep: bool,
     suppress_auto_off: bool,
     grace_until: Option<Instant>,
     angle_switch_after: Option<Instant>,
@@ -241,8 +245,9 @@ struct WakeGuard {
 }
 
 impl WakeGuard {
-    const fn sleep(&mut self) {
+    fn sleep(&mut self, system: bool) {
         self.sleeping = true;
+        self.system_sleeping |= system;
         self.suppress_auto_off = true;
         self.grace_until = None;
         self.angle_switch_after = None;
@@ -251,6 +256,8 @@ impl WakeGuard {
 
     fn wake(&mut self, now: Instant) {
         self.sleeping = false;
+        self.system_sleeping = false;
+        self.lid_closed_during_screen_sleep = false;
         self.suppress_auto_off = true;
         self.grace_until = Some(now + Duration::from_secs(60));
         self.angle_switch_after = Some(now + Duration::from_secs(8));
@@ -258,9 +265,32 @@ impl WakeGuard {
     }
 
     fn reset(&mut self) {
-        let sleeping = self.sleeping;
-        *self = Self::default();
-        self.sleeping = sleeping;
+        self.suppress_auto_off = false;
+        self.grace_until = None;
+        self.angle_switch_after = None;
+        self.absent_since = None;
+    }
+
+    fn watch_sleeping_lid(
+        &mut self,
+        auto_mode: bool,
+        read_lid: impl FnOnce() -> Option<bool>,
+    ) -> Option<Instant> {
+        if !auto_mode || self.system_sleeping {
+            return None;
+        }
+        if !self.lid_closed_during_screen_sleep {
+            self.lid_closed_during_screen_sleep = read_lid() == Some(true);
+        }
+        self.lid_closed_during_screen_sleep
+            .then(|| Instant::now() + Duration::from_secs(2))
+    }
+
+    fn lid_opened(&self, read_lid: impl FnOnce() -> Option<bool>) -> bool {
+        self.sleeping
+            && !self.system_sleeping
+            && self.lid_closed_during_screen_sleep
+            && read_lid() == Some(false)
     }
 
     fn angle_can_switch(&self, now: Instant) -> bool {
@@ -390,7 +420,8 @@ fn refresh(
         *bound_ready = false;
         unplug.reset();
         builtin_recovery.cancel();
-        return None;
+        return wake_guard
+            .watch_sleeping_lid(settings.bound_key.is_some(), lid_angle::clamshell_closed);
     }
     if settings.bound_key.is_none() || *quitting {
         *bound_ready = false;
@@ -508,7 +539,7 @@ fn refresh(
         // Only an online built-in has a trustworthy sleep state. A display
         // disabled by this app is absent from the online list and querying its
         // cached id can report "asleep" even after a real cable unplug.
-        let another_external_on = displays_now.iter().any(|d| !d.builtin && d.on);
+        let another_external_on = displays_now.iter().any(|d| !d.builtin && d.on && !d.asleep);
         // CoreGraphics can report the built-in as active while its panel is
         // still dark after unplug. Keep the old transition-based forced restore.
         let needs_restore = needs_builtin_restore(
@@ -517,7 +548,15 @@ fn refresh(
             settings.restore_builtin,
             *bound_was_present,
         );
-        if builtin_asleep || !needs_restore {
+        if builtin_asleep || (needs_restore && lid_angle::clamshell_closed() == Some(true)) {
+            // Keep the disconnect pending when the panel is asleep or the lid
+            // is closed. The next open observation gets a fresh settle window.
+            if builtin_recovery.reason() == Some(recovery::Reason::Unplug) {
+                *bound_was_present = true;
+            }
+            builtin_recovery.cancel();
+            unplug.since = None;
+        } else if !needs_restore {
             unplug.reset();
             if builtin_on {
                 *bound_was_present = false;
@@ -630,6 +669,22 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
             || rx.recv().map_err(|_| mpsc::RecvTimeoutError::Disconnected),
             |deadline| rx.recv_timeout(deadline.saturating_duration_since(Instant::now())),
         );
+        // An open lid can precede the screen-wake notification when the only
+        // panel was software-disabled. Recover from the physical lid event.
+        let event = match event {
+            Err(mpsc::RecvTimeoutError::Timeout)
+                if settings.bound_key.is_some()
+                    && auto_state
+                        .wake_guard
+                        .lid_opened(lid_angle::clamshell_closed) =>
+            {
+                diagnostics::record("lid opened during screen sleep");
+                Ok(WorkerEvent::PowerWake {
+                    screens_ready: false,
+                })
+            }
+            event => event,
+        };
         match event {
             Ok(ev) => {
                 match ev {
@@ -646,7 +701,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         pending_refresh = Some(Instant::now() + Duration::from_millis(700));
                         continue;
                     }
-                    WorkerEvent::PowerSleep => {
+                    WorkerEvent::PowerSleep { system } => {
                         if !auto_state.wake_guard.sleeping {
                             let external = displays::online_displays().into_iter().find(|d| {
                                 !d.builtin
@@ -662,20 +717,26 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         }
                         auto_state.bound_ready = false;
                         auto_state.unplug.reset();
+                        if auto_state.builtin_recovery.reason() == Some(recovery::Reason::Unplug) {
+                            auto_state.bound_was_present = true;
+                        }
                         auto_state.builtin_recovery.cancel();
                         if auto_state.quitting {
                             let _ = proxy.send_event(UserEvent::Exit);
                             return;
                         }
-                        diagnostics::record("power sleep");
+                        diagnostics::record(&format!("power sleep system={system}"));
                         auto_state.hdr_recovery.sleep();
-                        auto_state.wake_guard.sleep();
+                        auto_state.wake_guard.sleep(system);
                         angle_reader.reset();
                         current_angle = None;
                         angle_available = None;
                         angle_probe_requested = false;
                         next_angle_poll = None;
-                        pending_refresh = None;
+                        pending_refresh = auto_state.wake_guard.watch_sleeping_lid(
+                            settings.bound_key.is_some(),
+                            lid_angle::clamshell_closed,
+                        );
                         continue;
                     }
                     WorkerEvent::PowerWake { screens_ready } => {
@@ -1484,25 +1545,30 @@ impl Drop for PowerObservers {
 /// callbacks alone cannot distinguish a waking monitor from a cable pull.
 fn observe_power_events(tx: mpsc::Sender<WorkerEvent>) -> PowerObservers {
     let center = NSWorkspace::sharedWorkspace().notificationCenter();
-    let notifications = unsafe {
+    let notifications: [(_, fn() -> WorkerEvent); 4] = unsafe {
         [
-            (NSWorkspaceWillSleepNotification, true, false),
-            (NSWorkspaceScreensDidSleepNotification, true, false),
-            (NSWorkspaceDidWakeNotification, false, false),
-            (NSWorkspaceScreensDidWakeNotification, false, true),
+            (NSWorkspaceWillSleepNotification, || {
+                WorkerEvent::PowerSleep { system: true }
+            }),
+            (NSWorkspaceScreensDidSleepNotification, || {
+                WorkerEvent::PowerSleep { system: false }
+            }),
+            (NSWorkspaceDidWakeNotification, || WorkerEvent::PowerWake {
+                screens_ready: false,
+            }),
+            (NSWorkspaceScreensDidWakeNotification, || {
+                WorkerEvent::PowerWake {
+                    screens_ready: true,
+                }
+            }),
         ]
     };
     let tokens = notifications
         .into_iter()
-        .map(|(name, sleeping, screens_ready)| {
+        .map(|(name, event)| {
             let tx = tx.clone();
             let block = RcBlock::new(move |_notification: std::ptr::NonNull<NSNotification>| {
-                let event = if sleeping {
-                    WorkerEvent::PowerSleep
-                } else {
-                    WorkerEvent::PowerWake { screens_ready }
-                };
-                let _ = tx.send(event);
+                let _ = tx.send(event());
             });
             unsafe {
                 center.addObserverForName_object_queue_usingBlock(Some(name), None, None, &block)
@@ -1772,7 +1838,7 @@ mod worker_tests {
         let now = Instant::now();
         let mut guard = WakeGuard::default();
         assert_eq!(guard.unplug_delay(now, true, true), Duration::from_secs(5));
-        guard.sleep();
+        guard.sleep(true);
         assert_eq!(guard.unplug_delay(now, true, false), Duration::from_secs(5));
         guard.wake(now);
         assert_eq!(
@@ -1807,7 +1873,7 @@ mod worker_tests {
         assert!(!should_track_angle(&settings, &state));
         state.bound_ready = true;
         assert!(should_track_angle(&settings, &state));
-        state.wake_guard.sleep();
+        state.wake_guard.sleep(true);
         assert!(!should_track_angle(&settings, &state));
         state.wake_guard.wake(Instant::now());
         settings.open_above_angle = None;
@@ -1830,6 +1896,27 @@ mod worker_tests {
     }
 
     #[test]
+    fn lid_open_can_recover_before_the_screen_wake_notification() {
+        let mut guard = WakeGuard::default();
+        guard.sleep(false);
+        assert!(guard.watch_sleeping_lid(true, || Some(false)).is_none());
+        assert!(!guard.lid_opened(|| Some(false)));
+        assert!(guard.watch_sleeping_lid(true, || Some(true)).is_some());
+        assert!(!guard.lid_opened(|| Some(true)));
+        assert!(!guard.lid_opened(|| None));
+        assert!(guard.lid_opened(|| Some(false)));
+
+        guard.sleep(true);
+        guard.sleep(false); // A second screen notification cannot override system sleep.
+        assert!(guard
+            .watch_sleeping_lid(true, || panic!("system asleep"))
+            .is_none());
+        assert!(!guard.lid_opened(|| panic!("system asleep")));
+        guard.wake(Instant::now());
+        assert!(!guard.lid_opened(|| panic!("already awake")));
+    }
+
+    #[test]
     fn missing_bound_monitor_restores_disabled_builtin() {
         assert!(needs_builtin_restore(false, false, true, false));
     }
@@ -1843,7 +1930,7 @@ mod worker_tests {
     fn wake_does_not_reapply_auto_off_when_monitor_returns() {
         let now = Instant::now();
         let mut guard = WakeGuard::default();
-        guard.sleep();
+        guard.sleep(true);
         guard.wake(now);
         guard.observe_bound(false, now + Duration::from_secs(2));
         guard.observe_bound(true, now + Duration::from_secs(12));
@@ -1894,7 +1981,7 @@ mod worker_tests {
         }
         assert!(matches!(
             rx.recv_timeout(Duration::from_secs(1)).unwrap(),
-            WorkerEvent::PowerSleep
+            WorkerEvent::PowerSleep { system: true }
         ));
         unsafe {
             center.postNotificationName_object(NSWorkspaceDidWakeNotification, None);

@@ -94,7 +94,11 @@ impl Recovery {
         if now < task.next && now < task.expires {
             return Ok(self.deadline());
         }
-        if now >= task.next && task.attempts > 0 && builtin == BuiltinState::Awake {
+        if now >= task.next
+            && task.attempts > 0
+            && task.last_error.is_none()
+            && builtin == BuiltinState::Awake
+        {
             self.cancel();
             return Ok(None);
         }
@@ -107,9 +111,9 @@ impl Recovery {
             return Err(error);
         }
         let permanent = task.reason != Reason::Angle || task.attempts >= 3;
-        if let Err(error) = enable(permanent) {
+        task.last_error = enable(permanent).err();
+        if let Some(error) = &task.last_error {
             crate::diagnostics::record(&format!("builtin recovery request failed: {error}"));
-            task.last_error = Some(error);
         }
         task.attempts += 1;
         task.next = now + Duration::from_millis(300);
@@ -234,5 +238,27 @@ mod tests {
             ),
             Ok(None)
         );
+    }
+
+    #[test]
+    fn reported_active_does_not_confirm_a_rejected_enable_request() {
+        let now = Instant::now();
+        let mut recovery = Recovery::default();
+        recovery.request(Reason::Unplug, now);
+        recovery
+            .step(now, BuiltinState::Awake, |_| Err("rejected".into()))
+            .unwrap();
+        let mut requested = false;
+        recovery
+            .step(
+                now + Duration::from_millis(300),
+                BuiltinState::Awake,
+                |_| {
+                    requested = true;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert!(requested);
     }
 }
