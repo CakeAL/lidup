@@ -111,7 +111,7 @@ pub fn online_displays() -> Vec<DisplayInfo> {
             return Vec::new();
         }
         ids.truncate(count as usize);
-        ids.into_iter().map(describe).collect()
+        ids.into_iter().filter_map(describe).collect()
     }
 }
 
@@ -127,7 +127,7 @@ pub fn known_displays() -> Result<Vec<DisplayInfo>, String> {
     let ids = known_display_ids(|capacity, ids, count| unsafe { get(capacity, ids, count) })?;
     Ok(merge_displays(
         online_displays(),
-        ids.into_iter().map(describe).collect(),
+        ids.into_iter().filter_map(describe).collect(),
     ))
 }
 
@@ -164,7 +164,11 @@ fn merge_displays(mut online: Vec<DisplayInfo>, known: Vec<DisplayInfo>) -> Vec<
     online
 }
 
-fn describe(id: DisplayID) -> DisplayInfo {
+fn is_placeholder(on: bool, identity: (u32, u32, u32), size: (u32, u32)) -> bool {
+    !on && identity == (0, 0, 0) && size.0 <= 1 && size.1 <= 1
+}
+
+fn describe(id: DisplayID) -> Option<DisplayInfo> {
     unsafe {
         let builtin = CGDisplayIsBuiltin(id) != 0;
         let on = CGDisplayIsActive(id) != 0;
@@ -175,6 +179,9 @@ fn describe(id: DisplayID) -> DisplayInfo {
         let bounds = CGDisplayBounds(id);
         let width = bounds.size.width as u32;
         let height = bounds.size.height as u32;
+        if !builtin && is_placeholder(on, (vendor, model, serial), (width, height)) {
+            return None;
+        }
         // The display itself doesn't expose a friendly name via public/private
         // CoreGraphics on Apple Silicon, so build a stable, distinguishable one.
         let name = if builtin {
@@ -183,7 +190,7 @@ fn describe(id: DisplayID) -> DisplayInfo {
             format!("External Display {vendor:04x}-{model:04x}")
         };
         let key = format!("{vendor:04x}:{model:04x}:{serial}");
-        DisplayInfo {
+        Some(DisplayInfo {
             id,
             builtin,
             on,
@@ -192,7 +199,7 @@ fn describe(id: DisplayID) -> DisplayInfo {
             height,
             name,
             key,
-        }
+        })
     }
 }
 
@@ -438,6 +445,15 @@ mod tests {
         );
         assert_eq!(list.len(), 2);
         assert!(list[0].on);
+    }
+
+    #[test]
+    fn only_placeholder_signatures_are_excluded() {
+        assert!(is_placeholder(false, (0, 0, 0), (1, 1)));
+        assert!(is_placeholder(false, (0, 0, 0), (0, 0)));
+        assert!(!is_placeholder(false, (0x4c23, 0x2765, 0), (1, 1)));
+        assert!(!is_placeholder(false, (0, 0, 0), (1920, 1080)));
+        assert!(!is_placeholder(true, (0, 0, 0), (1, 1)));
     }
 
     #[test]
