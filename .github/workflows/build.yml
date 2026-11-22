@@ -82,7 +82,10 @@ jobs:
 
       - name: Create release
         uses: softprops/action-gh-release@v2
+        env:
+          RELEASE_NOTES_PATH: .github/release-notes/${{ github.ref_name }}.md
         with:
+          body_path: ${{ hashFiles(env.RELEASE_NOTES_PATH) != '' && env.RELEASE_NOTES_PATH || '' }}
           files: target/release/lidup.zip
           fail_on_unmatched_files: true
           generate_release_notes: true
