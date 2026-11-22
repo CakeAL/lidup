@@ -43,6 +43,7 @@ extern "C" {
         options: u32,
     ) -> CFRef;
     fn IOObjectRelease(entry: u32) -> i32;
+    fn IOPMAssertionDeclareUserActivity(name: CFRef, user_type: u32, id: *mut u32) -> i32;
     fn IOHIDManagerCreate(allocator: CFRef, options: u32) -> HIDRef;
     fn IOHIDManagerOpen(manager: HIDRef, options: u32) -> i32;
     fn IOHIDManagerClose(manager: HIDRef, options: u32) -> i32;
@@ -61,6 +62,7 @@ extern "C" {
 
 const UTF8: u32 = 0x0800_0100;
 const FEATURE_REPORT: i32 = 2;
+const USER_ACTIVE_LOCAL: u32 = 0;
 
 /// Physical lid state, independent of the angle threshold and display topology.
 pub fn clamshell_closed() -> Option<bool> {
@@ -86,6 +88,26 @@ pub fn clamshell_closed() -> Option<bool> {
             (CFGetTypeID(value) == CFBooleanGetTypeID()).then(|| CFBooleanGetValue(value) != 0);
         CFRelease(value);
         closed
+    }
+}
+
+/// Tell power management about the user's lid-open activity after the panel
+/// rejoins the display layout. The assertion expires at the normal idle timeout.
+pub fn wake_after_lid_open(assertion_id: &mut u32) -> Result<(), String> {
+    unsafe {
+        let name = CFStringCreateWithCString(ptr::null(), c"lidup: lid opened".as_ptr(), UTF8);
+        if name.is_null() {
+            return Err("无法创建显示器唤醒请求".into());
+        }
+        let result = IOPMAssertionDeclareUserActivity(name, USER_ACTIVE_LOCAL, assertion_id);
+        CFRelease(name);
+        if result == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "IOPMAssertionDeclareUserActivity failed ({result:#x})"
+            ))
+        }
     }
 }
 

@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Reason {
     Unplug,
+    LidOpen,
     Angle,
     Manual,
     Quit,
@@ -45,6 +46,10 @@ pub struct Recovery {
 impl Recovery {
     pub fn reason(&self) -> Option<Reason> {
         self.task.as_ref().map(|task| task.reason)
+    }
+
+    pub fn is_unplug(&self) -> bool {
+        matches!(self.reason(), Some(Reason::Unplug | Reason::LidOpen))
     }
 
     pub fn deadline(&self) -> Option<Instant> {
@@ -155,7 +160,13 @@ mod tests {
     #[test]
     fn sleeping_builtin_cancels_every_recovery_purpose_without_configuration() {
         let now = Instant::now();
-        for reason in [Reason::Unplug, Reason::Angle, Reason::Manual, Reason::Quit] {
+        for reason in [
+            Reason::Unplug,
+            Reason::LidOpen,
+            Reason::Angle,
+            Reason::Manual,
+            Reason::Quit,
+        ] {
             let mut recovery = Recovery::default();
             recovery.request(reason, now);
             assert_eq!(

@@ -237,7 +237,9 @@ const fn needs_builtin_restore(
 struct WakeGuard {
     sleeping: bool,
     system_sleeping: bool,
-    lid_closed_during_screen_sleep: bool,
+    lid_closed_during_sleep: bool,
+    lid_recovery_until: Option<Instant>,
+    screens_ready: bool,
     suppress_auto_off: bool,
     grace_until: Option<Instant>,
     angle_switch_after: Option<Instant>,
@@ -245,19 +247,26 @@ struct WakeGuard {
 }
 
 impl WakeGuard {
-    fn sleep(&mut self, system: bool) {
+    fn sleep(&mut self, system: bool, lid_closed: Option<bool>) {
         self.sleeping = true;
+        self.lid_closed_during_sleep |= lid_closed == Some(true);
         self.system_sleeping |= system;
         self.suppress_auto_off = true;
         self.grace_until = None;
         self.angle_switch_after = None;
+        self.lid_recovery_until = None;
+        self.screens_ready = false;
         self.absent_since = None;
     }
 
     fn wake(&mut self, now: Instant) {
         self.sleeping = false;
         self.system_sleeping = false;
-        self.lid_closed_during_screen_sleep = false;
+        self.lid_recovery_until = self
+            .lid_closed_during_sleep
+            .then(|| now + Duration::from_secs(5));
+        self.lid_closed_during_sleep = false;
+        self.screens_ready = false;
         self.suppress_auto_off = true;
         self.grace_until = Some(now + Duration::from_secs(60));
         self.angle_switch_after = Some(now + Duration::from_secs(8));
@@ -268,6 +277,7 @@ impl WakeGuard {
         self.suppress_auto_off = false;
         self.grace_until = None;
         self.angle_switch_after = None;
+        self.lid_recovery_until = None;
         self.absent_since = None;
     }
 
@@ -279,22 +289,28 @@ impl WakeGuard {
         if !auto_mode || self.system_sleeping {
             return None;
         }
-        if !self.lid_closed_during_screen_sleep {
-            self.lid_closed_during_screen_sleep = read_lid() == Some(true);
+        if !self.lid_closed_during_sleep {
+            self.lid_closed_during_sleep = read_lid() == Some(true);
         }
-        self.lid_closed_during_screen_sleep
+        self.lid_closed_during_sleep
             .then(|| Instant::now() + Duration::from_secs(2))
     }
 
     fn lid_opened(&self, read_lid: impl FnOnce() -> Option<bool>) -> bool {
         self.sleeping
             && !self.system_sleeping
-            && self.lid_closed_during_screen_sleep
+            && self.lid_closed_during_sleep
             && read_lid() == Some(false)
     }
 
     fn angle_can_switch(&self, now: Instant) -> bool {
         !self.sleeping && self.angle_switch_after.is_none_or(|ready| now >= ready)
+    }
+
+    fn recovering_from_lid_open(&self, now: Instant, lid_closed: Option<bool>) -> bool {
+        !self.sleeping
+            && lid_closed == Some(false)
+            && self.lid_recovery_until.is_some_and(|until| now < until)
     }
 
     fn unplug_delay(&self, now: Instant, removal_seen: bool, hdr_pending: bool) -> Duration {
@@ -352,9 +368,20 @@ impl UnplugWatch {
         }
     }
 
-    fn deadline(&mut self, now: Instant, guard: &WakeGuard, hdr_pending: bool) -> Instant {
+    fn deadline(
+        &mut self,
+        now: Instant,
+        guard: &WakeGuard,
+        hdr_pending: bool,
+        lid_open_recovery: bool,
+    ) -> Instant {
         let since = *self.since.get_or_insert(now);
-        since + guard.unplug_delay(now, self.removal_seen, hdr_pending)
+        let delay = if lid_open_recovery {
+            Duration::from_millis(250)
+        } else {
+            guard.unplug_delay(now, self.removal_seen, hdr_pending)
+        };
+        since + delay
     }
 }
 
@@ -368,6 +395,7 @@ struct AutoState {
     quitting: bool,
     bound_ready: bool,
     trace_requested: bool,
+    display_activity_assertion: u32,
 }
 
 fn advance_builtin_recovery(
@@ -375,14 +403,14 @@ fn advance_builtin_recovery(
     settings: &Settings,
     recovery: &mut recovery::Recovery,
     builtin: Option<&DisplayInfo>,
-) -> Option<Instant> {
+) -> Result<Option<Instant>, String> {
     match recovery.step(Instant::now(), builtin.into(), |permanent| {
         displays::enable_builtin_once(settings.builtin_id, permanent)
     }) {
-        Ok(next) => next,
+        Ok(next) => Ok(next),
         Err(error) => {
-            report_result(proxy, "恢复内建屏", Err(error));
-            None
+            report_result(proxy, "恢复内建屏", Err(error.clone()));
+            Err(error)
         }
     }
 }
@@ -410,6 +438,7 @@ fn refresh(
         quitting,
         bound_ready,
         trace_requested,
+        display_activity_assertion,
     } = state;
     hdr_recovery.bind(settings.bound_key.as_deref());
     // auto = None means the user wants full manual control: do NOT touch the built-in
@@ -444,7 +473,7 @@ fn refresh(
             current_angle,
             angle_available,
         )));
-        return retry;
+        return retry.ok().flatten();
     }
 
     let before_id = settings.builtin_id;
@@ -469,10 +498,13 @@ fn refresh(
     *bound_ready = external.is_some();
     wake_guard.observe_bound(bound_present, Instant::now());
     let mut retry_at = None;
+    let mut lid_closed = None;
+    let another_external_on = displays_now.iter().any(|d| !d.builtin && d.on && !d.asleep);
     if let Some(bound) = bound {
         unplug.present(bound.id);
         *bound_was_present = true;
-        if builtin_recovery.reason() == Some(recovery::Reason::Unplug) {
+        wake_guard.lid_recovery_until = None;
+        if builtin_recovery.is_unplug() {
             builtin_recovery.cancel();
         }
         let angle_rule = settings.open_above_angle.is_some();
@@ -539,19 +571,26 @@ fn refresh(
         // Only an online built-in has a trustworthy sleep state. A display
         // disabled by this app is absent from the online list and querying its
         // cached id can report "asleep" even after a real cable unplug.
-        let another_external_on = displays_now.iter().any(|d| !d.builtin && d.on && !d.asleep);
         // CoreGraphics can report the built-in as active while its panel is
         // still dark after unplug. Keep the old transition-based forced restore.
+        let screens_woke_with_builtin = wake_guard.screens_ready
+            && builtin_on
+            && wake_guard
+                .grace_until
+                .is_some_and(|until| Instant::now() < until);
         let needs_restore = needs_builtin_restore(
             builtin_on,
             another_external_on,
             settings.restore_builtin,
-            *bound_was_present,
+            *bound_was_present && !screens_woke_with_builtin,
         );
-        if builtin_asleep || (needs_restore && lid_angle::clamshell_closed() == Some(true)) {
+        lid_closed = (needs_restore || builtin_recovery.is_unplug())
+            .then(lid_angle::clamshell_closed)
+            .flatten();
+        if builtin_asleep || lid_closed == Some(true) {
             // Keep the disconnect pending when the panel is asleep or the lid
             // is closed. The next open observation gets a fresh settle window.
-            if builtin_recovery.reason() == Some(recovery::Reason::Unplug) {
+            if builtin_recovery.is_unplug() {
                 *bound_was_present = true;
             }
             builtin_recovery.cancel();
@@ -561,22 +600,41 @@ fn refresh(
             if builtin_on {
                 *bound_was_present = false;
             }
-        } else {
+            if screens_woke_with_builtin && builtin_recovery.is_unplug() {
+                builtin_recovery.cancel();
+            }
+        } else if !builtin_recovery.is_unplug() {
             // Even a remove notification only describes the active list. Use
             // the short path after wake/HDR negotiation has finished, and read
             // the display list again before touching the built-in.
             let now = Instant::now();
             let first_absence = unplug.since.is_none();
-            let deadline = unplug.deadline(now, wake_guard, hdr_recovery.restore_pending());
+            // A closed-to-open transition with no usable physical output is
+            // independent of the bound monitor's wake/HDR negotiation.
+            let lid_open_recovery = *bound_was_present
+                && !builtin_on
+                && !another_external_on
+                && wake_guard.recovering_from_lid_open(now, lid_closed);
+            let deadline = unplug.deadline(
+                now,
+                wake_guard,
+                hdr_recovery.restore_pending(),
+                lid_open_recovery,
+            );
             if first_absence {
                 diagnostics::record(&format!(
-                    "bound absent removal_seen={} confirmation_ms={}",
+                    "bound absent removal_seen={} lid_open_recovery={lid_open_recovery} confirmation_ms={}",
                     unplug.removal_seen,
                     deadline.saturating_duration_since(now).as_millis()
                 ));
             }
             if Instant::now() >= deadline {
-                builtin_recovery.request(recovery::Reason::Unplug, Instant::now());
+                let reason = if lid_open_recovery {
+                    recovery::Reason::LidOpen
+                } else {
+                    recovery::Reason::Unplug
+                };
+                builtin_recovery.request(reason, now);
                 unplug.reset();
                 *bound_was_present = false;
             } else {
@@ -585,8 +643,22 @@ fn refresh(
         }
     }
 
-    if let Some(at) = advance_builtin_recovery(proxy, settings, builtin_recovery, builtin) {
-        retry_at = Some(retry_at.map_or(at, |other| other.min(at)));
+    let wake_recovered_panel =
+        builtin_recovery.reason() == Some(recovery::Reason::LidOpen) && !wake_guard.screens_ready;
+    match advance_builtin_recovery(proxy, settings, builtin_recovery, builtin) {
+        Ok(Some(at)) => retry_at = Some(retry_at.map_or(at, |other| other.min(at))),
+        Ok(None)
+            if wake_recovered_panel
+                && builtin_on
+                && !builtin_asleep
+                && !another_external_on
+                && lid_closed == Some(false) =>
+        {
+            let result = lid_angle::wake_after_lid_open(display_activity_assertion);
+            diagnostics::record(&format!("display power wake after lid open: {result:?}"));
+            report_result(proxy, "唤醒内建屏", result);
+        }
+        _ => {}
     }
 
     if settings.builtin_id != before_id || settings.builtin_key != before_key {
@@ -702,6 +774,11 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         continue;
                     }
                     WorkerEvent::PowerSleep { system } => {
+                        let lid_closed = settings
+                            .bound_key
+                            .is_some()
+                            .then(lid_angle::clamshell_closed)
+                            .flatten();
                         if !auto_state.wake_guard.sleeping {
                             let external = displays::online_displays().into_iter().find(|d| {
                                 !d.builtin
@@ -717,7 +794,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         }
                         auto_state.bound_ready = false;
                         auto_state.unplug.reset();
-                        if auto_state.builtin_recovery.reason() == Some(recovery::Reason::Unplug) {
+                        if auto_state.builtin_recovery.is_unplug() {
                             auto_state.bound_was_present = true;
                         }
                         auto_state.builtin_recovery.cancel();
@@ -725,9 +802,11 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                             let _ = proxy.send_event(UserEvent::Exit);
                             return;
                         }
-                        diagnostics::record(&format!("power sleep system={system}"));
+                        diagnostics::record(&format!(
+                            "power sleep system={system} lid_closed={lid_closed:?}"
+                        ));
                         auto_state.hdr_recovery.sleep();
-                        auto_state.wake_guard.sleep(system);
+                        auto_state.wake_guard.sleep(system, lid_closed);
                         angle_reader.reset();
                         current_angle = None;
                         angle_available = None;
@@ -755,6 +834,7 @@ fn worker(proxy: winit::event_loop::EventLoopProxy<UserEvent>, rx: mpsc::Receive
                         }
                         auto_state.hdr_recovery.wake(now);
                         if screens_ready {
+                            auto_state.wake_guard.screens_ready = true;
                             auto_state.hdr_recovery.screens_woke(now);
                         }
                         diagnostics::record(&format!(
@@ -1793,10 +1873,10 @@ mod worker_tests {
             removed: true,
         }));
         let first_snapshot = now + Duration::from_millis(700);
-        let due = watch.deadline(first_snapshot, &guard, false);
+        let due = watch.deadline(first_snapshot, &guard, false, false);
         assert_eq!(due, now + Duration::from_millis(950));
         assert_eq!(
-            watch.deadline(now + Duration::from_millis(900), &guard, false),
+            watch.deadline(now + Duration::from_millis(900), &guard, false, false),
             due
         );
         // A reconnection clears both the evidence and its confirmation clock.
@@ -1816,19 +1896,19 @@ mod worker_tests {
         let mut watch = super::UnplugWatch::default();
         watch.reconfigured(removal); // no previously observed bound display
         assert_eq!(
-            watch.deadline(now, &guard, false),
+            watch.deadline(now, &guard, false, false),
             now + Duration::from_secs(5)
         );
         watch.present(4);
         watch.reconfigured(removal); // another display's removal
         assert_eq!(
-            watch.deadline(now, &guard, false),
+            watch.deadline(now, &guard, false, false),
             now + Duration::from_secs(5)
         );
         watch.present(3);
         watch.reconfigured(None); // watchdog/initial refresh has no removal evidence
         assert_eq!(
-            watch.deadline(now, &guard, false),
+            watch.deadline(now, &guard, false, false),
             now + Duration::from_secs(5)
         );
     }
@@ -1838,7 +1918,7 @@ mod worker_tests {
         let now = Instant::now();
         let mut guard = WakeGuard::default();
         assert_eq!(guard.unplug_delay(now, true, true), Duration::from_secs(5));
-        guard.sleep(true);
+        guard.sleep(true, None);
         assert_eq!(guard.unplug_delay(now, true, false), Duration::from_secs(5));
         guard.wake(now);
         assert_eq!(
@@ -1857,7 +1937,7 @@ mod worker_tests {
         }));
         watch.reset(); // the worker clears evidence on sleep, wake and rebinding
         assert_eq!(
-            watch.deadline(now + Duration::from_secs(61), &guard, false),
+            watch.deadline(now + Duration::from_secs(61), &guard, false, false),
             now + Duration::from_secs(66)
         );
     }
@@ -1873,7 +1953,7 @@ mod worker_tests {
         assert!(!should_track_angle(&settings, &state));
         state.bound_ready = true;
         assert!(should_track_angle(&settings, &state));
-        state.wake_guard.sleep(true);
+        state.wake_guard.sleep(true, None);
         assert!(!should_track_angle(&settings, &state));
         state.wake_guard.wake(Instant::now());
         settings.open_above_angle = None;
@@ -1898,7 +1978,7 @@ mod worker_tests {
     #[test]
     fn lid_open_can_recover_before_the_screen_wake_notification() {
         let mut guard = WakeGuard::default();
-        guard.sleep(false);
+        guard.sleep(false, None);
         assert!(guard.watch_sleeping_lid(true, || Some(false)).is_none());
         assert!(!guard.lid_opened(|| Some(false)));
         assert!(guard.watch_sleeping_lid(true, || Some(true)).is_some());
@@ -1906,14 +1986,40 @@ mod worker_tests {
         assert!(!guard.lid_opened(|| None));
         assert!(guard.lid_opened(|| Some(false)));
 
-        guard.sleep(true);
-        guard.sleep(false); // A second screen notification cannot override system sleep.
+        guard.sleep(true, None);
+        guard.sleep(false, None); // A second screen notification cannot override system sleep.
         assert!(guard
             .watch_sleeping_lid(true, || panic!("system asleep"))
             .is_none());
         assert!(!guard.lid_opened(|| panic!("system asleep")));
         guard.wake(Instant::now());
         assert!(!guard.lid_opened(|| panic!("already awake")));
+    }
+
+    #[test]
+    fn confirmed_lid_open_shortens_the_absence_check_during_wake() {
+        let now = Instant::now();
+        let mut guard = WakeGuard::default();
+        guard.sleep(true, Some(true));
+        assert!(!guard.recovering_from_lid_open(now, Some(false)));
+        guard.wake(now);
+        let first_snapshot = now + Duration::from_millis(700);
+        assert!(!guard.recovering_from_lid_open(first_snapshot, Some(true)));
+        assert!(!guard.recovering_from_lid_open(first_snapshot, None));
+        assert!(!guard.recovering_from_lid_open(now + Duration::from_secs(5), Some(false)));
+        let mut watch = super::UnplugWatch::default();
+        assert_eq!(
+            watch.deadline(
+                first_snapshot,
+                &guard,
+                true,
+                guard.recovering_from_lid_open(first_snapshot, Some(false)),
+            ),
+            now + Duration::from_millis(950)
+        );
+        guard.sleep(true, None);
+        guard.wake(now);
+        assert!(!guard.recovering_from_lid_open(first_snapshot, Some(false)));
     }
 
     #[test]
@@ -1930,7 +2036,7 @@ mod worker_tests {
     fn wake_does_not_reapply_auto_off_when_monitor_returns() {
         let now = Instant::now();
         let mut guard = WakeGuard::default();
-        guard.sleep(true);
+        guard.sleep(true, None);
         guard.wake(now);
         guard.observe_bound(false, now + Duration::from_secs(2));
         guard.observe_bound(true, now + Duration::from_secs(12));
